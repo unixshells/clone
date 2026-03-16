@@ -1,0 +1,17 @@
+[package]
+name = "clone-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Clone guest agent — reports activity and memory pressure to VMM"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+# Static binary with musl for minimal size
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

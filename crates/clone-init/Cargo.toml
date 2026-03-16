@@ -1,0 +1,12 @@
+[package]
+name = "clone-init"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal init binary for Clone guest rootfs boot"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "clone-init"
+path = "src/main.rs"

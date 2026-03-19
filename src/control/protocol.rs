@@ -104,7 +104,11 @@ pub enum ResponseBody {
         vm_id: String,
         pid: u32,
     },
-    Ack {},
+    ExecResult {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
     VmStatus {
         state: String,
         uptime_secs: f64,
@@ -130,11 +134,7 @@ pub enum ResponseBody {
         downtime_ms: u64,
         total_time_ms: u64,
     },
-    ExecResult {
-        exit_code: i32,
-        stdout: String,
-        stderr: String,
-    },
+    Ack {},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

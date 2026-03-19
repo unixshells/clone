@@ -86,6 +86,14 @@ mod vhost {
         pub padding: u32,
         pub regions: [MemoryRegion; 1],
     }
+
+    /// Memory table with 2 regions (for split memory around MMIO hole).
+    #[repr(C)]
+    pub struct Memory2 {
+        pub nregions: u32,
+        pub padding: u32,
+        pub regions: [MemoryRegion; 2],
+    }
 }
 
 /// A virtio-vsock device.
@@ -116,6 +124,8 @@ pub struct VirtioVsock {
     queue_configs: Vec<QueueInfo>,
     guest_mem: *mut u8,
     guest_mem_size: u64,
+    hole_start: u64,
+    hole_end: u64,
 
     /// KVM VM fd for irqfd/ioeventfd registration.
     vm_fd: RawFd,
@@ -129,6 +139,18 @@ pub struct VirtioVsock {
 unsafe impl Send for VirtioVsock {}
 
 impl VirtioVsock {
+    /// Translate GPA to host virtual address, accounting for MMIO hole.
+    fn gpa_to_hva(&self, gpa: u64) -> u64 {
+        let base = self.guest_mem as u64;
+        if self.hole_start == 0 || gpa < self.hole_start {
+            base + gpa
+        } else if gpa >= self.hole_end {
+            base + self.hole_start + (gpa - self.hole_end)
+        } else {
+            base + gpa
+        }
+    }
+
     /// Create a new virtio-vsock device with the given guest CID.
     ///
     /// On Linux, opens /dev/vhost-vsock and claims the CID.
@@ -169,6 +191,8 @@ impl VirtioVsock {
             queue_configs: Vec::new(),
             guest_mem: std::ptr::null_mut(),
             guest_mem_size: 0,
+            hole_start: 0,
+            hole_end: 0,
             vm_fd: -1,
             irq: 0,
             mmio_base: 0,
@@ -281,24 +305,56 @@ impl VirtioVsock {
             ));
         }
 
-        // VHOST_SET_MEM_TABLE
-        let mem_table = vhost::Memory {
-            nregions: 1,
-            padding: 0,
-            regions: [vhost::MemoryRegion {
-                guest_phys_addr: 0,
-                memory_size: self.guest_mem_size,
-                userspace_addr: self.guest_mem as u64,
-                flags_padding: 0,
-            }],
-        };
-        if unsafe { libc::ioctl(fd, vhost::SET_MEM_TABLE, &mem_table as *const vhost::Memory) }
-            < 0
-        {
-            return Err(anyhow::anyhow!(
-                "VHOST_SET_MEM_TABLE failed: {}",
-                std::io::Error::last_os_error()
-            ));
+        // VHOST_SET_MEM_TABLE — describe guest memory regions to vhost kernel
+        if self.hole_start > 0 {
+            // Large VM: two regions around the MMIO hole
+            let above_hole_size = self.guest_mem_size - self.hole_start;
+            let mem_table = vhost::Memory2 {
+                nregions: 2,
+                padding: 0,
+                regions: [
+                    vhost::MemoryRegion {
+                        guest_phys_addr: 0,
+                        memory_size: self.hole_start,
+                        userspace_addr: self.guest_mem as u64,
+                        flags_padding: 0,
+                    },
+                    vhost::MemoryRegion {
+                        guest_phys_addr: self.hole_end,
+                        memory_size: above_hole_size,
+                        userspace_addr: (self.guest_mem as u64) + self.hole_start,
+                        flags_padding: 0,
+                    },
+                ],
+            };
+            if unsafe { libc::ioctl(fd, vhost::SET_MEM_TABLE, &mem_table as *const vhost::Memory2) }
+                < 0
+            {
+                return Err(anyhow::anyhow!(
+                    "VHOST_SET_MEM_TABLE (2 regions) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        } else {
+            // Small VM: single region
+            let mem_table = vhost::Memory {
+                nregions: 1,
+                padding: 0,
+                regions: [vhost::MemoryRegion {
+                    guest_phys_addr: 0,
+                    memory_size: self.guest_mem_size,
+                    userspace_addr: self.guest_mem as u64,
+                    flags_padding: 0,
+                }],
+            };
+            if unsafe { libc::ioctl(fd, vhost::SET_MEM_TABLE, &mem_table as *const vhost::Memory) }
+                < 0
+            {
+                return Err(anyhow::anyhow!(
+                    "VHOST_SET_MEM_TABLE failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
         }
 
         // Set up RX (0), TX (1), and event (2) queues.
@@ -327,9 +383,9 @@ impl VirtioVsock {
                 let addr = vhost::VringAddr {
                     index: qi,
                     flags: 0,
-                    desc_user_addr: guest_mem_base + qc.desc_addr,
-                    used_user_addr: guest_mem_base + qc.used_addr,
-                    avail_user_addr: guest_mem_base + qc.avail_addr,
+                    desc_user_addr: self.gpa_to_hva(qc.desc_addr),
+                    used_user_addr: self.gpa_to_hva(qc.used_addr),
+                    avail_user_addr: self.gpa_to_hva(qc.avail_addr),
                     log_guest_addr: 0,
                 };
                 unsafe { libc::ioctl(fd, vhost::SET_VRING_ADDR, &addr) };
@@ -379,9 +435,9 @@ impl VirtioVsock {
             let addr = vhost::VringAddr {
                 index: qi,
                 flags: 0,
-                desc_user_addr: guest_mem_base + qc.desc_addr,
-                used_user_addr: guest_mem_base + qc.used_addr,
-                avail_user_addr: guest_mem_base + qc.avail_addr,
+                desc_user_addr: self.gpa_to_hva(qc.desc_addr),
+                used_user_addr: self.gpa_to_hva(qc.used_addr),
+                avail_user_addr: self.gpa_to_hva(qc.avail_addr),
                 log_guest_addr: 0,
             };
             if unsafe { libc::ioctl(fd, vhost::SET_VRING_ADDR, &addr) } < 0 {
@@ -530,6 +586,11 @@ impl VirtioDevice for VirtioVsock {
         self.queue_configs = queues.to_vec();
         self.guest_mem = guest_mem;
         self.guest_mem_size = mem_size;
+    }
+
+    fn set_memory_hole(&mut self, hole_start: u64, hole_end: u64) {
+        self.hole_start = hole_start;
+        self.hole_end = hole_end;
     }
 
     fn activate(&mut self) -> anyhow::Result<()> {

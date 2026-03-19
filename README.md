@@ -195,6 +195,8 @@ Three layers stacked to minimize host RAM across VMs:
 
 Result: 10 idle 512MB VMs use ~200MB of host RAM, not 5GB.
 
+VMs with >3GB RAM automatically get split memory regions around the x86 PCI MMIO hole (3-4GB). The guest sees all requested memory (e.g., 4GB VM → 3.8Gi usable, 8GB → 7.8Gi). No configuration needed — Clone handles the split transparently.
+
 ### CoW Template Fork
 
 ```
@@ -420,7 +422,7 @@ Clone exposes this via CLI (`clone fork`, `clone run`) and Unix socket API. Your
 
 **19,371 lines of Rust. 63 e2e tests (62 pass, 1 skip). Single binary.**
 
-Working: full VM boot, 5 virtio devices, PCI/VFIO passthrough, CoW fork (<20ms), live migration (1ms downtime), snapshots (full + incremental), memory overcommit + KSM + balloon, virtio-fs, overlay mode (tmpfs + block), rootfs creation (Alpine, Ubuntu, Docker import), seccomp, measured boot, multi-vCPU SMP, guest agent with remote exec, guest networking (auto bridge/TAP/NAT/DNS), per-VM CID allocation, daemon orchestration (create/fork/snapshot/destroy), console attach, daemonless VM listing.
+Working: full VM boot (up to 64GB RAM), 5 virtio devices, PCI/VFIO passthrough, CoW fork (<20ms), live migration (1ms downtime), snapshots (full + incremental), memory overcommit + KSM + balloon, split memory regions (MMIO hole handling for >3GB VMs), virtio-fs, overlay mode (tmpfs + block), rootfs creation (Alpine, Ubuntu, Debian, Docker import) with `--release` flag, compressed kernel module support (.ko.zst, .ko.xz), seccomp, measured boot, multi-vCPU SMP, guest agent with remote exec, guest networking (auto bridge/TAP/NAT/DNS), per-VM CID allocation, daemon orchestration (create/fork/snapshot/destroy), console attach, daemonless VM listing.
 
 Needs work: MSI-X interrupt routing (stubbed), SR-IOV, vGPU/mdev, confidential VMs (TDX/SEV).
 

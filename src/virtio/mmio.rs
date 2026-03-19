@@ -174,13 +174,26 @@ impl MmioTransport {
 
     /// Set the guest memory pointer and size, and update all virtqueues.
     pub fn set_guest_memory(&mut self, guest_mem: *mut u8, guest_mem_size: u64) {
+        self.set_guest_memory_with_hole(guest_mem, guest_mem_size, 0, 0);
+    }
+
+    /// Set guest memory with MMIO hole info for large VMs.
+    pub fn set_guest_memory_with_hole(&mut self, guest_mem: *mut u8, guest_mem_size: u64, hole_start: u64, hole_end: u64) {
         self.guest_mem = guest_mem;
         self.guest_mem_size = guest_mem_size;
-        // Recreate virtqueues with the new memory pointer
+        if hole_start > 0 {
+            self.device.set_memory_hole(hole_start, hole_end);
+        }
         let queue_max_sizes = self.device.queue_max_sizes().to_vec();
         self.virtqueues = queue_max_sizes
             .iter()
-            .map(|&max_size| Virtqueue::new(max_size, guest_mem, guest_mem_size))
+            .map(|&max_size| {
+                let mut q = Virtqueue::new(max_size, guest_mem, guest_mem_size);
+                if hole_start > 0 {
+                    q.set_hole(hole_start, hole_end);
+                }
+                q
+            })
             .collect();
     }
 
@@ -627,10 +640,15 @@ impl MmioBus {
 
     /// Set the guest memory pointer and size for all current and future devices.
     pub fn set_guest_memory(&mut self, guest_mem: *mut u8, guest_mem_size: u64) {
+        self.set_guest_memory_with_hole(guest_mem, guest_mem_size, 0, 0);
+    }
+
+    /// Set guest memory with MMIO hole info.
+    pub fn set_guest_memory_with_hole(&mut self, guest_mem: *mut u8, guest_mem_size: u64, hole_start: u64, hole_end: u64) {
         self.guest_mem = guest_mem;
         self.guest_mem_size = guest_mem_size;
         for transport in &mut self.devices {
-            transport.set_guest_memory(guest_mem, guest_mem_size);
+            transport.set_guest_memory_with_hole(guest_mem, guest_mem_size, hole_start, hole_end);
         }
     }
 

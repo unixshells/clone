@@ -152,50 +152,45 @@ fn load_bzimage(mem: &GuestMem, data: &[u8], _cmdline: &str, ram_size: u64) -> R
     mem.write_at(BOOT_PARAMS_ADDR + BP_HEAP_END_PTR, &heap_end.to_le_bytes())?;
 
     // Set up e820 memory map — the kernel needs this to know available RAM.
-    // Standard layout matching QEMU/SeaBIOS: mark all usable RAM as E820_RAM.
-    // The kernel reserves its own text/data/BSS/brk via memblock_reserve().
     //
-    // IMPORTANT: The kernel text area (phys 0x100000+) MUST be in E820_RAM
-    // so the direct mapping covers it. Without this, CPA (change_page_attr)
-    // cannot find the direct mapping for kernel text pages, and corrupts
-    // the text mapping when applying read-only/NX protection.
-    let reserved_top: u64 = 0x20000; // 128KB reserved at top
-    let e820_ram_end = ram_size - reserved_top;
+    // IMPORTANT: The kernel text area (phys 0x100000+) MUST be in E820_RAM.
+    //
+    // For VMs > 3GB, the MMIO hole (3GB-4GB) splits RAM into two regions:
+    //   Region 1: 1MB to 3GB (below hole)
+    //   Region 2: 4GB to 4GB + overflow (above hole)
+    let mmio_hole_start: u64 = 0xC000_0000; // 3 GB
+    let mmio_hole_end: u64 = 0x1_0000_0000; // 4 GB
 
-    let e820_entries = [
-        // Usable RAM below 640K (real mode area, minus 1KB for EBDA)
-        E820Entry { addr: 0, size: 0x9FC00, type_: E820_RAM },
-        // Reserved: EBDA (1KB)
-        E820Entry { addr: 0x9FC00, size: 0x400, type_: E820_RESERVED },
-        // Reserved: BIOS ROM area (0xF0000 - 0xFFFFF)
-        E820Entry { addr: 0xF0000, size: 0x10000, type_: E820_RESERVED },
-        // Usable RAM from 1MB to (ram_size - 128KB)
-        // Kernel text/data is here — must be E820_RAM for direct mapping
-        // coverage, otherwise CPA corrupts kernel text during mark_rodata_ro()
-        E820Entry {
-            addr: 0x100000,
-            size: e820_ram_end - 0x100000,
-            type_: E820_RAM,
-        },
-        // Reserved: top 128KB for BIOS tables
-        E820Entry {
-            addr: e820_ram_end,
-            size: reserved_top,
-            type_: E820_RESERVED,
-        },
-        // Reserved: IOAPIC/LAPIC MMIO region (matching QEMU/SeaBIOS)
-        E820Entry {
-            addr: 0xFEFFC000,
-            size: 0x4000,
-            type_: E820_RESERVED,
-        },
-        // Reserved: High BIOS ROM area (matching QEMU/SeaBIOS)
-        E820Entry {
-            addr: 0xFFFC0000,
-            size: 0x40000,
-            type_: E820_RESERVED,
-        },
-    ];
+    let mut e820: Vec<E820Entry> = Vec::with_capacity(9);
+
+    // Usable RAM below 640K
+    e820.push(E820Entry { addr: 0, size: 0x9FC00, type_: E820_RAM });
+    // Reserved: EBDA
+    e820.push(E820Entry { addr: 0x9FC00, size: 0x400, type_: E820_RESERVED });
+    // Reserved: BIOS ROM
+    e820.push(E820Entry { addr: 0xF0000, size: 0x10000, type_: E820_RESERVED });
+
+    if ram_size <= mmio_hole_start {
+        // Small VM: single RAM region
+        let reserved_top: u64 = 0x20000;
+        let ram_end = ram_size - reserved_top;
+        e820.push(E820Entry { addr: 0x100000, size: ram_end - 0x100000, type_: E820_RAM });
+        e820.push(E820Entry { addr: ram_end, size: reserved_top, type_: E820_RESERVED });
+    } else {
+        // Large VM: split RAM around the MMIO hole
+        // Region below hole: 1MB to 3GB
+        e820.push(E820Entry { addr: 0x100000, size: mmio_hole_start - 0x100000, type_: E820_RAM });
+        // Region above hole: 4GB to 4GB + overflow
+        let above_hole = ram_size - mmio_hole_start;
+        e820.push(E820Entry { addr: mmio_hole_end, size: above_hole, type_: E820_RAM });
+    }
+
+    // Reserved: IOAPIC/LAPIC MMIO
+    e820.push(E820Entry { addr: 0xFEFFC000, size: 0x4000, type_: E820_RESERVED });
+    // Reserved: High BIOS ROM
+    e820.push(E820Entry { addr: 0xFFFC0000, size: 0x40000, type_: E820_RESERVED });
+
+    let e820_entries = &e820;
 
     // Write e820 entry count
     mem.write_at(BOOT_PARAMS_ADDR + BP_E820_ENTRIES, &[e820_entries.len() as u8])?;
@@ -311,17 +306,29 @@ fn load_initrd(mem: &GuestMem, path: &str) -> Result<()> {
     let initrd_data = std::fs::read(path)
         .with_context(|| format!("Failed to read initrd: {path}"))?;
 
-    // Place initrd at a high address (below guest memory top, aligned to page)
-    let initrd_addr = mem.size() - initrd_data.len() as u64;
+    // Place initrd at a high address below the MMIO hole (or below memory top for small VMs).
+    // For large VMs with a hole, place it below 3GB to keep it in the first memory slot.
+    let initrd_top = if mem.has_hole() {
+        mem.hole_start()
+    } else {
+        mem.size()
+    };
+    let initrd_addr = initrd_top - initrd_data.len() as u64;
     let initrd_addr = initrd_addr & !0xFFF; // page-align down
 
     mem.write_at(initrd_addr, &initrd_data)?;
 
-    // Update boot_params with initrd location
-    let initrd_addr_u32 = initrd_addr as u32;
+    // Update boot_params with initrd location.
+    // ramdisk_image (0x218) is the low 32 bits.
+    // ext_ramdisk_image (0x0C0) is the high 32 bits (for initrd above 4GB).
+    let initrd_lo = initrd_addr as u32;
+    let initrd_hi = (initrd_addr >> 32) as u32;
     let initrd_size_u32 = initrd_data.len() as u32;
-    mem.write_at(BOOT_PARAMS_ADDR + 0x218, &initrd_addr_u32.to_le_bytes())?;
+    mem.write_at(BOOT_PARAMS_ADDR + 0x218, &initrd_lo.to_le_bytes())?;
     mem.write_at(BOOT_PARAMS_ADDR + 0x21C, &initrd_size_u32.to_le_bytes())?;
+    if initrd_hi > 0 {
+        mem.write_at(BOOT_PARAMS_ADDR + 0x0C0, &initrd_hi.to_le_bytes())?;
+    }
 
     tracing::info!("initrd loaded: {} bytes at {initrd_addr:#x}", initrd_data.len());
 

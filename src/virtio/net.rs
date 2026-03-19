@@ -92,6 +92,12 @@ mod vhost {
         pub regions: [MemoryRegion; 1],
     }
 
+    #[repr(C)]
+    pub struct Memory2 {
+        pub nregions: u32,
+        pub padding: u32,
+        pub regions: [MemoryRegion; 2],
+    }
 }
 
 /// A virtio-net device backed by a TAP file descriptor.
@@ -134,12 +140,24 @@ pub struct VirtioNet {
     queue_configs: Vec<QueueInfo>,
     guest_mem: *mut u8,
     guest_mem_size: u64,
+    hole_start: u64,
+    hole_end: u64,
 }
 
 // SAFETY: The raw pointers are managed exclusively by the VMM.
 unsafe impl Send for VirtioNet {}
 
 impl VirtioNet {
+    fn gpa_to_hva(&self, gpa: u64) -> u64 {
+        let base = self.guest_mem as u64;
+        if self.hole_start == 0 || gpa < self.hole_start {
+            base + gpa
+        } else if gpa >= self.hole_end {
+            base + self.hole_start + (gpa - self.hole_end)
+        } else {
+            base + gpa
+        }
+    }
     /// Create a new virtio-net device with the given TAP fd and MAC address.
     ///
     /// Call `set_vm_info()` before registration to enable vhost-net.
@@ -159,6 +177,8 @@ impl VirtioNet {
             queue_configs: Vec::new(),
             guest_mem: std::ptr::null_mut(),
             guest_mem_size: 0,
+            hole_start: 0,
+            hole_end: 0,
         }
     }
 
@@ -265,23 +285,43 @@ impl VirtioNet {
             ));
         }
 
-        // 4. VHOST_SET_MEM_TABLE — single contiguous guest memory region
-        let mem_table = vhost::Memory {
-            nregions: 1,
-            padding: 0,
-            regions: [vhost::MemoryRegion {
-                guest_phys_addr: 0,
-                memory_size: self.guest_mem_size,
-                userspace_addr: self.guest_mem as u64,
-                flags_padding: 0,
-            }],
-        };
-        let ret = unsafe {
-            libc::ioctl(
-                vhost_fd,
+        // 4. VHOST_SET_MEM_TABLE — guest memory regions
+        let ret = if self.hole_start > 0 {
+            let above_hole_size = self.guest_mem_size - self.hole_start;
+            let mem_table = vhost::Memory2 {
+                nregions: 2,
+                padding: 0,
+                regions: [
+                    vhost::MemoryRegion {
+                        guest_phys_addr: 0,
+                        memory_size: self.hole_start,
+                        userspace_addr: self.guest_mem as u64,
+                        flags_padding: 0,
+                    },
+                    vhost::MemoryRegion {
+                        guest_phys_addr: self.hole_end,
+                        memory_size: above_hole_size,
+                        userspace_addr: (self.guest_mem as u64) + self.hole_start,
+                        flags_padding: 0,
+                    },
+                ],
+            };
+            unsafe { libc::ioctl(vhost_fd, vhost::SET_MEM_TABLE, &mem_table as *const vhost::Memory2) }
+        } else {
+            let mem_table = vhost::Memory {
+                nregions: 1,
+                padding: 0,
+                regions: [vhost::MemoryRegion {
+                    guest_phys_addr: 0,
+                    memory_size: self.guest_mem_size,
+                    userspace_addr: self.guest_mem as u64,
+                    flags_padding: 0,
+                }],
+            };
+            unsafe { libc::ioctl(vhost_fd,
                 vhost::SET_MEM_TABLE,
                 &mem_table as *const vhost::Memory,
-            )
+            ) }
         };
         if ret < 0 {
             return Err(anyhow::anyhow!(
@@ -326,9 +366,9 @@ impl VirtioNet {
             let addr = vhost::VringAddr {
                 index: qi,
                 flags: 0,
-                desc_user_addr: guest_mem_base + qc.desc_addr,
-                used_user_addr: guest_mem_base + qc.used_addr,
-                avail_user_addr: guest_mem_base + qc.avail_addr,
+                desc_user_addr: self.gpa_to_hva(qc.desc_addr),
+                used_user_addr: self.gpa_to_hva(qc.used_addr),
+                avail_user_addr: self.gpa_to_hva(qc.avail_addr),
                 log_guest_addr: 0,
             };
             if unsafe { libc::ioctl(vhost_fd, vhost::SET_VRING_ADDR, &addr) } < 0 {
@@ -526,6 +566,11 @@ impl VirtioDevice for VirtioNet {
         self.queue_configs = queues.to_vec();
         self.guest_mem = guest_mem;
         self.guest_mem_size = mem_size;
+    }
+
+    fn set_memory_hole(&mut self, hole_start: u64, hole_end: u64) {
+        self.hole_start = hole_start;
+        self.hole_end = hole_end;
     }
 
     fn activate(&mut self) -> anyhow::Result<()> {

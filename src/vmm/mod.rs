@@ -111,33 +111,78 @@ impl Vm {
         let boot_start = std::time::Instant::now();
 
         // 1. Set up guest memory with overcommit (MAP_NORESERVE)
-        // Allocate 2MB extra beyond what the e820 map reports to the kernel.
-        // The kernel probes one past the declared RAM end during
-        // init_mem_mapping / struct page setup, so the KVM memory region
-        // must extend beyond the e820 boundary.
         let mem_size = (self.config.mem_mb as u64) << 20;
-        // Add guard region past e820 end — the kernel accesses multiple pages past
-        // max_pfn through the direct mapping during init (likely struct page / zone
-        // setup). The VMM injects PDE entries into the kernel page tables to cover
-        // these accesses, backed by this extra KVM memory.
-        let guard_size: u64 = 128 << 20; // 128MB (one SPARSEMEM section)
-        let alloc_size = mem_size + guard_size;
-        let guest_memory = memory::create_guest_memory(alloc_size)
-            .context("Failed to create guest memory")?;
+        let guard_size: u64 = 128 << 20; // 128MB guard past e820 end
+        let mmio_hole_start: u64 = 0xC000_0000; // 3 GB — MMIO hole starts here
+        let mmio_hole_end: u64 = 0x1_0000_0000; // 4 GB — MMIO hole ends here
 
-        // 2. Register memory region with KVM (includes guard pages)
-        // KVM_MEM_LOG_DIRTY_PAGES enables dirty page tracking for incremental snapshots.
-        let mem_region = kvm_userspace_memory_region {
-            slot: 0,
-            guest_phys_addr: 0,
-            memory_size: alloc_size,
-            userspace_addr: guest_memory.as_ptr() as u64,
-            flags: KVM_MEM_LOG_DIRTY_PAGES,
+        let alloc_size = if mem_size <= mmio_hole_start {
+            mem_size + guard_size
+        } else {
+            mmio_hole_start + (mem_size - mmio_hole_start) + guard_size
         };
-        unsafe {
-            self.vm_fd
-                .set_user_memory_region(mem_region)
-                .context("Failed to set KVM memory region")?;
+
+        let guest_memory = if mem_size <= mmio_hole_start {
+            memory::create_guest_memory(alloc_size)
+                .context("Failed to create guest memory")?
+        } else {
+            memory::create_guest_memory_with_hole(alloc_size, mmio_hole_start, mmio_hole_end)
+                .context("Failed to create guest memory")?
+        };
+
+        // 2. Register memory region(s) with KVM
+        if !guest_memory.has_hole() {
+            // Small VM: single KVM slot
+            let mem_region = kvm_userspace_memory_region {
+                slot: 0,
+                guest_phys_addr: 0,
+                memory_size: mem_size + guard_size,
+                userspace_addr: guest_memory.as_ptr() as u64,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            unsafe {
+                self.vm_fd
+                    .set_user_memory_region(mem_region)
+                    .context("Failed to set KVM memory region")?;
+            }
+        } else {
+            // Large VM: two KVM slots around the MMIO hole
+            let above_hole = mem_size - mmio_hole_start;
+
+            // Slot 0: GPA [0, hole_start) — below MMIO hole
+            let region0 = kvm_userspace_memory_region {
+                slot: 0,
+                guest_phys_addr: 0,
+                memory_size: mmio_hole_start,
+                userspace_addr: guest_memory.as_ptr() as u64,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            unsafe {
+                self.vm_fd
+                    .set_user_memory_region(region0)
+                    .context("Failed to set KVM memory region (below MMIO hole)")?;
+            }
+
+            // Slot 1: GPA [hole_end, hole_end + above_hole + guard) — above 4GB
+            let region1 = kvm_userspace_memory_region {
+                slot: 1,
+                guest_phys_addr: mmio_hole_end,
+                memory_size: above_hole + guard_size,
+                userspace_addr: (guest_memory.as_ptr() as u64) + mmio_hole_start,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            unsafe {
+                self.vm_fd
+                    .set_user_memory_region(region1)
+                    .context("Failed to set KVM memory region (above 4GB)")?;
+            }
+
+            tracing::info!(
+                "Split memory: slot0=0..{:#x} ({}MB), slot1={:#x}..+{}MB, total={}MB",
+                mmio_hole_start, mmio_hole_start >> 20,
+                mmio_hole_end, (above_hole + guard_size) >> 20,
+                mem_size >> 20,
+            );
         }
 
         let t_memory = boot_start.elapsed();
@@ -302,7 +347,7 @@ impl Vm {
         // Set guest memory on the MMIO bus for virtqueue descriptor chain processing
         {
             let mut mmio_bus = self.mmio_bus.lock().unwrap();
-            mmio_bus.set_guest_memory(guest_memory.as_ptr(), mem_size);
+            mmio_bus.set_guest_memory_with_hole(guest_memory.as_ptr(), guest_memory.size(), guest_memory.hole_start(), guest_memory.hole_end());
         }
 
         // Build the final kernel command line with virtio_mmio.device parameters
@@ -541,7 +586,7 @@ impl Vm {
                 }
             }
 
-            mmio_bus.set_guest_memory(guest_memory.as_ptr(), mem_size);
+            mmio_bus.set_guest_memory_with_hole(guest_memory.as_ptr(), guest_memory.size(), guest_memory.hole_start(), guest_memory.hole_end());
 
             // 5. Inject unique identity into guest memory
             identity::inject_identity(&guest_memory, &identity)?;

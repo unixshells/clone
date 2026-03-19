@@ -61,8 +61,12 @@ pub struct Virtqueue {
     last_avail_idx: u16,
     /// Host pointer to guest physical address 0.
     guest_mem: *mut u8,
-    /// Total size of the guest memory region.
+    /// Total size of the guest memory mmap region.
     guest_mem_size: u64,
+    /// MMIO hole: GPA range [hole_start, hole_end) has no backing memory.
+    /// GPAs above hole_end map to userspace at (guest_mem + hole_start + (gpa - hole_end)).
+    hole_start: u64,
+    hole_end: u64,
 }
 
 // SAFETY: The raw pointer is managed exclusively by the VMM.
@@ -70,8 +74,6 @@ unsafe impl Send for Virtqueue {}
 
 impl Virtqueue {
     /// Create a new virtqueue with the given size and guest memory region.
-    ///
-    /// The queue starts unconfigured (addresses zeroed) and not ready.
     pub fn new(size: u16, guest_mem: *mut u8, guest_mem_size: u64) -> Self {
         Self {
             size,
@@ -82,7 +84,15 @@ impl Virtqueue {
             last_avail_idx: 0,
             guest_mem,
             guest_mem_size,
+            hole_start: 0,
+            hole_end: 0,
         }
+    }
+
+    /// Set the MMIO hole info for GPA-to-HVA translation on large VMs.
+    pub fn set_hole(&mut self, hole_start: u64, hole_end: u64) {
+        self.hole_start = hole_start;
+        self.hole_end = hole_end;
     }
 
     /// Configure the three ring area addresses.
@@ -113,18 +123,33 @@ impl Virtqueue {
 
     // --- Guest memory helpers ---
 
+    /// Translate a guest physical address to a userspace offset,
+    /// accounting for the MMIO hole on large VMs.
+    fn gpa_to_offset(&self, gpa: u64) -> Option<usize> {
+        if self.hole_start == 0 {
+            // No hole — direct mapping
+            if gpa >= self.guest_mem_size { return None; }
+            return Some(gpa as usize);
+        }
+        if gpa < self.hole_start {
+            Some(gpa as usize)
+        } else if gpa >= self.hole_end {
+            let offset = self.hole_start + (gpa - self.hole_end);
+            if offset >= self.guest_mem_size { return None; }
+            Some(offset as usize)
+        } else {
+            None // In the MMIO hole — no backing memory
+        }
+    }
+
     /// Read bytes from guest memory at the given guest physical address.
-    /// Returns `None` if the access is out of bounds.
     fn guest_read(&self, gpa: u64, len: u64) -> Option<&[u8]> {
-        if gpa.checked_add(len)? > self.guest_mem_size {
-            return None;
-        }
-        if self.guest_mem.is_null() {
-            return None;
-        }
+        let offset = self.gpa_to_offset(gpa)?;
+        if offset + len as usize > self.guest_mem_size as usize { return None; }
+        if self.guest_mem.is_null() { return None; }
         unsafe {
             Some(std::slice::from_raw_parts(
-                self.guest_mem.add(gpa as usize),
+                self.guest_mem.add(offset),
                 len as usize,
             ))
         }
@@ -132,15 +157,12 @@ impl Virtqueue {
 
     /// Get a mutable slice of guest memory at the given GPA.
     fn guest_write(&self, gpa: u64, len: u64) -> Option<&mut [u8]> {
-        if gpa.checked_add(len)? > self.guest_mem_size {
-            return None;
-        }
-        if self.guest_mem.is_null() {
-            return None;
-        }
+        let offset = self.gpa_to_offset(gpa)?;
+        if offset + len as usize > self.guest_mem_size as usize { return None; }
+        if self.guest_mem.is_null() { return None; }
         unsafe {
             Some(std::slice::from_raw_parts_mut(
-                self.guest_mem.add(gpa as usize),
+                self.guest_mem.add(offset),
                 len as usize,
             ))
         }

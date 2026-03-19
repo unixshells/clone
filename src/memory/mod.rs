@@ -22,30 +22,37 @@ const GUEST_MEM_START: u64 = 0;
 /// on first write. This is Layer 2 of the memory stack.
 pub struct GuestMem {
     ptr: *mut u8,
-    size: u64,
+    size: u64, // total mmap'd size (contiguous userspace allocation)
+    /// For VMs > 3GB, the MMIO hole splits guest physical address space:
+    /// GPA [0, hole_start) maps to userspace [ptr, ptr+hole_start)
+    /// GPA [hole_end, ...) maps to userspace [ptr+hole_start, ...)
+    /// If hole_start == 0, there is no hole (small VM).
+    hole_start: u64, // 0 = no hole
+    hole_end: u64,
 }
 
 impl GuestMem {
-    /// Create a GuestMem from a raw pointer and size.
-    ///
-    /// # Safety
-    /// The caller must ensure that `ptr` points to a valid mmap-ed region of
-    /// at least `size` bytes, and that the region will be valid for the
-    /// lifetime of this struct. The region will be munmap-ed on drop.
+    /// Create a GuestMem from a raw pointer and size (no MMIO hole).
     pub fn from_raw(ptr: *mut u8, size: u64) -> Self {
-        Self { ptr, size }
+        Self { ptr, size, hole_start: 0, hole_end: 0 }
+    }
+
+    /// Create a GuestMem with an MMIO hole for large VMs.
+    /// The hole splits the guest physical address space:
+    /// - GPA [0, hole_start) → userspace [ptr, ptr+hole_start)
+    /// - GPA [hole_end, ...) → userspace [ptr+hole_start, ...)
+    pub fn from_raw_with_hole(ptr: *mut u8, size: u64, hole_start: u64, hole_end: u64) -> Self {
+        Self { ptr, size, hole_start, hole_end }
     }
 
     /// Create a temporary borrow of existing guest memory.
-    ///
-    /// Unlike `from_raw`, this creates a GuestMem that does NOT munmap on drop.
-    /// Used by the snapshot handler to reference the VM's memory without ownership.
-    ///
-    /// # Safety
-    /// The caller must ensure the pointer is valid and the memory outlives
-    /// the returned GuestMem.
     pub unsafe fn borrow_raw(ptr: *mut u8, size: u64) -> BorrowedGuestMem {
-        BorrowedGuestMem { inner: GuestMem { ptr, size } }
+        BorrowedGuestMem { inner: GuestMem { ptr, size, hole_start: 0, hole_end: 0 } }
+    }
+
+    /// Create a temporary borrow with MMIO hole info.
+    pub unsafe fn borrow_raw_with_hole(ptr: *mut u8, size: u64, hole_start: u64, hole_end: u64) -> BorrowedGuestMem {
+        BorrowedGuestMem { inner: GuestMem { ptr, size, hole_start, hole_end } }
     }
 
     pub fn as_ptr(&self) -> *mut u8 {
@@ -56,27 +63,85 @@ impl GuestMem {
         self.size
     }
 
+    pub fn hole_start(&self) -> u64 {
+        self.hole_start
+    }
+
+    pub fn hole_end(&self) -> u64 {
+        self.hole_end
+    }
+
+    pub fn has_hole(&self) -> bool {
+        self.hole_start > 0
+    }
+
+    /// Translate a guest physical address (GPA) to a userspace pointer offset.
+    /// Accounts for the MMIO hole if present.
+    fn gpa_to_offset(&self, gpa: u64) -> Result<usize> {
+        if self.hole_start == 0 {
+            // No hole — direct mapping
+            if gpa >= self.size {
+                anyhow::bail!("GPA {gpa:#x} exceeds memory size {:#x}", self.size);
+            }
+            return Ok(gpa as usize);
+        }
+
+        if gpa < self.hole_start {
+            // Below the hole — direct mapping
+            Ok(gpa as usize)
+        } else if gpa >= self.hole_end {
+            // Above the hole — subtract the hole size
+            let offset = self.hole_start + (gpa - self.hole_end);
+            if offset >= self.size {
+                anyhow::bail!("GPA {gpa:#x} (offset {offset:#x}) exceeds memory size {:#x}", self.size);
+            }
+            Ok(offset as usize)
+        } else {
+            anyhow::bail!("GPA {gpa:#x} is in the MMIO hole ({:#x}..{:#x})", self.hole_start, self.hole_end);
+        }
+    }
+
+    /// Translate a GPA to a raw host virtual address pointer.
+    /// Used by virtio devices for DMA.
+    pub fn gpa_to_hva(&self, gpa: u64) -> Result<*mut u8> {
+        let offset = self.gpa_to_offset(gpa)?;
+        Ok(unsafe { self.ptr.add(offset) })
+    }
+
     /// Write bytes to a guest physical address.
-    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
-        if offset + data.len() as u64 > self.size {
-            anyhow::bail!("Write at {offset:#x} + {} exceeds memory size", data.len());
+    pub fn write_at(&self, gpa: u64, data: &[u8]) -> Result<()> {
+        let offset = self.gpa_to_offset(gpa)?;
+        if offset + data.len() > self.size as usize {
+            anyhow::bail!("Write at GPA {gpa:#x} + {} exceeds memory", data.len());
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(offset as usize), data.len());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(offset), data.len());
         }
         Ok(())
     }
 
     /// Read bytes from a guest physical address.
-    pub fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        if offset + len as u64 > self.size {
-            anyhow::bail!("Read at {offset:#x} + {len} exceeds memory size");
+    pub fn read_at(&self, gpa: u64, len: usize) -> Result<Vec<u8>> {
+        let offset = self.gpa_to_offset(gpa)?;
+        if offset + len > self.size as usize {
+            anyhow::bail!("Read at GPA {gpa:#x} + {len} exceeds memory");
         }
         let mut buf = vec![0u8; len];
         unsafe {
-            std::ptr::copy_nonoverlapping(self.ptr.add(offset as usize), buf.as_mut_ptr(), len);
+            std::ptr::copy_nonoverlapping(self.ptr.add(offset), buf.as_mut_ptr(), len);
         }
         Ok(buf)
+    }
+
+    /// Get the guest physical memory size (including the hole gap for large VMs).
+    /// This is the total GPA space, not the userspace allocation size.
+    pub fn guest_phys_size(&self) -> u64 {
+        if self.hole_start == 0 {
+            self.size
+        } else {
+            // Total GPA = below hole + hole gap + above hole
+            self.hole_end + (self.size - self.hole_start)
+        }
     }
 }
 
@@ -119,7 +184,12 @@ impl Drop for BorrowedGuestMem {
 
 /// Allocate guest memory with overcommit (MAP_NORESERVE).
 /// Physical pages only allocated on first write — kernel handles faults natively.
+/// For VMs > 3GB, pass hole_start/hole_end to create split memory regions.
 pub fn create_guest_memory(size: u64) -> Result<GuestMem> {
+    create_guest_memory_with_hole(size, 0, 0)
+}
+
+pub fn create_guest_memory_with_hole(size: u64, hole_start: u64, hole_end: u64) -> Result<GuestMem> {
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -145,6 +215,8 @@ pub fn create_guest_memory(size: u64) -> Result<GuestMem> {
     Ok(GuestMem {
         ptr: ptr as *mut u8,
         size,
+        hole_start,
+        hole_end,
     })
 }
 

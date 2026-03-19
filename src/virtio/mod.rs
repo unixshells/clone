@@ -116,6 +116,10 @@ pub trait VirtioDevice: Send {
     /// vhost setup) should store this information for use in activate().
     fn prepare_activate(&mut self, _queues: &[QueueInfo], _guest_mem: *mut u8, _mem_size: u64) {}
 
+    /// Set MMIO hole info for GPA-to-HVA translation on large VMs.
+    /// Called before activate() for VMs with >3GB RAM.
+    fn set_memory_hole(&mut self, _hole_start: u64, _hole_end: u64) {}
+
     /// Reset the device to initial state.
     fn reset(&mut self);
 

@@ -142,16 +142,33 @@ fn embed_kernel_modules(cpio: &mut Vec<u8>) {
     let mut count = 0;
     for (subdir, name) in modules {
         let path = mod_root.join(subdir).join(name);
-        match fs::read(&path) {
-            Ok(data) => {
-                let cpio_path = format!("/lib/modules/{name}");
-                cpio_write_entry(cpio, &cpio_path, 0o100644, &data);
-                count += 1;
+        // Try uncompressed first, then .zst (Ubuntu 24.04+), then .xz, then .gz
+        let (data, found_name) = if let Ok(d) = fs::read(&path) {
+            (d, name.to_string())
+        } else if let Ok(d) = fs::read(format!("{}.zst", path.display())) {
+            match decompress_zstd(&d) {
+                Ok(decompressed) => (decompressed, name.to_string()),
+                Err(e) => {
+                    tracing::debug!("failed to decompress {name}.zst: {e}");
+                    continue;
+                }
             }
-            Err(e) => {
-                tracing::debug!("kernel module {name} not found: {e}");
+        } else if let Ok(d) = fs::read(format!("{}.xz", path.display())) {
+            match decompress_xz(&d) {
+                Ok(decompressed) => (decompressed, name.to_string()),
+                Err(e) => {
+                    tracing::debug!("failed to decompress {name}.xz: {e}");
+                    continue;
+                }
             }
-        }
+        } else {
+            tracing::debug!("kernel module {name} not found (tried .ko, .ko.zst, .ko.xz)");
+            continue;
+        };
+
+        let cpio_path = format!("/lib/modules/{found_name}");
+        cpio_write_entry(cpio, &cpio_path, 0o100644, &data);
+        count += 1;
     }
 
     if count > 0 {
@@ -328,6 +345,43 @@ fn pad4(buf: &mut Vec<u8>) {
     for _ in 0..padding {
         buf.push(0);
     }
+}
+
+/// Decompress zstd-compressed data by shelling out to `zstd`.
+/// Kernel modules on Ubuntu 24.04+ are .ko.zst compressed.
+fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("zstd")
+        .args(["-d", "--stdout", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("failed to run zstd (is zstd installed?)")?;
+    child.stdin.take().unwrap().write_all(data)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        anyhow::bail!("zstd decompression failed");
+    }
+    Ok(output.stdout)
+}
+
+/// Decompress xz-compressed data by shelling out to `xz`.
+fn decompress_xz(data: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("xz")
+        .args(["-d", "--stdout", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("failed to run xz (is xz installed?)")?;
+    child.stdin.take().unwrap().write_all(data)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        anyhow::bail!("xz decompression failed");
+    }
+    Ok(output.stdout)
 }
 
 #[cfg(test)]

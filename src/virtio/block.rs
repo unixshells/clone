@@ -227,8 +227,15 @@ impl VirtioBlock {
     }
 
     fn do_read(&mut self, sector: u64, buf: &mut [u8]) -> u8 {
-        let offset = sector * SECTOR_SIZE;
-        if offset + buf.len() as u64 > self.capacity_sectors * SECTOR_SIZE {
+        let Some(offset) = sector.checked_mul(SECTOR_SIZE) else {
+            tracing::error!("virtio-block: sector*SECTOR_SIZE overflow on read (sector={sector})");
+            return VIRTIO_BLK_S_IOERR;
+        };
+        let Some(end) = offset.checked_add(buf.len() as u64) else {
+            tracing::error!("virtio-block: offset+len overflow on read");
+            return VIRTIO_BLK_S_IOERR;
+        };
+        if end > self.capacity_sectors * SECTOR_SIZE {
             tracing::error!("virtio-block: read past end of disk");
             return VIRTIO_BLK_S_IOERR;
         }
@@ -261,8 +268,15 @@ impl VirtioBlock {
             return VIRTIO_BLK_S_IOERR;
         }
 
-        let offset = sector * SECTOR_SIZE;
-        if offset + data.len() as u64 > self.capacity_sectors * SECTOR_SIZE {
+        let Some(offset) = sector.checked_mul(SECTOR_SIZE) else {
+            tracing::error!("virtio-block: sector*SECTOR_SIZE overflow on write (sector={sector})");
+            return VIRTIO_BLK_S_IOERR;
+        };
+        let Some(end) = offset.checked_add(data.len() as u64) else {
+            tracing::error!("virtio-block: offset+len overflow on write");
+            return VIRTIO_BLK_S_IOERR;
+        };
+        if end > self.capacity_sectors * SECTOR_SIZE {
             tracing::error!("virtio-block: write past end of disk");
             return VIRTIO_BLK_S_IOERR;
         }
@@ -854,6 +868,30 @@ mod tests {
         let (tmp, path) = make_temp_disk(SECTOR_SIZE * 10);
         let dev = VirtioBlock::open(&path, false).unwrap();
         assert_eq!(dev.format(), DiskFormat::Raw);
+        drop(tmp);
+    }
+
+    #[test]
+    fn test_read_rejects_sector_offset_overflow() {
+        // sector * SECTOR_SIZE must not silently wrap around. A guest that
+        // sends a request with sector ≈ u64::MAX/512 would have produced a
+        // wrapped offset that "passes" the end-of-disk check and then read
+        // arbitrary bytes from the host file.
+        let (tmp, path) = make_temp_disk(SECTOR_SIZE * 10);
+        let mut dev = VirtioBlock::open(&path, false).unwrap();
+        let mut buf = vec![0u8; 512];
+        let status = dev.process_request(VIRTIO_BLK_T_IN, u64::MAX / 4, &mut buf);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR, "overflowing sector must return IOERR");
+        drop(tmp);
+    }
+
+    #[test]
+    fn test_write_rejects_sector_offset_overflow() {
+        let (tmp, path) = make_temp_disk(SECTOR_SIZE * 10);
+        let mut dev = VirtioBlock::open(&path, false).unwrap();
+        let mut buf = vec![0xAAu8; 512];
+        let status = dev.process_request(VIRTIO_BLK_T_OUT, u64::MAX / 4, &mut buf);
+        assert_eq!(status, VIRTIO_BLK_S_IOERR);
         drop(tmp);
     }
 }

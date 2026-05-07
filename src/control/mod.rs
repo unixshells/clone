@@ -200,11 +200,13 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
             let mut effective_cmdline = cmdline;
             effective_cmdline.push_str(" clone.agent_port=9999");
             if net {
-                let host_part = 2 + vm_index;
-                let guest_ip = format!("172.30.{}.{}", host_part / 256, host_part % 256);
+                // Use the same allocator the spawned child will use for TAP
+                // setup, so the cmdline values and the actual TAP allocation
+                // agree.
+                let alloc = crate::net::allocate_subnet(vm_index as u32);
                 effective_cmdline.push_str(&format!(
-                    " clone.net_ip={} clone.net_gw=172.30.0.1 clone.net_mask=16",
-                    guest_ip
+                    " clone.net_ip={} clone.net_gw={} clone.net_mask={}",
+                    alloc.guest_ip, alloc.host_ip, alloc.prefix
                 ));
             }
 

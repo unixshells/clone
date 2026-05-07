@@ -489,8 +489,26 @@ fn main() -> Result<()> {
 
                 // Handle --net (auto-setup) vs --tap (manual)
                 let (effective_tap, pre_opened_tap_fd) = if net {
-                    match net::auto_setup_network(std::process::id()) {
-                        Ok((tap_name, tap_fd, _guest_ip)) => {
+                    // When --cid is provided (typically by the daemon when
+                    // spawning), derive vm_index from it so this child agrees
+                    // with the parent about which /30 subnet to use. Otherwise
+                    // fall back to PID for standalone direct invocations.
+                    let vm_index = match cid {
+                        Some(c) if c >= 3 => (c - 3) as u32,
+                        _ => std::process::id(),
+                    };
+                    match net::auto_setup_network(vm_index) {
+                        Ok((tap_name, tap_fd, alloc)) => {
+                            // Set cmdline net params from the actual allocation
+                            // so the guest configures eth0 to match what the
+                            // host expects. Skip if the daemon already injected
+                            // them (idempotency for the spawned-child path).
+                            if !cmdline.contains("clone.net_ip=") {
+                                cmdline.push_str(&format!(
+                                    " clone.net_ip={} clone.net_gw={} clone.net_mask={}",
+                                    alloc.guest_ip, alloc.host_ip, alloc.prefix
+                                ));
+                            }
                             (Some(tap_name), Some(tap_fd))
                         }
                         Err(e) => {
@@ -715,8 +733,14 @@ fn main() -> Result<()> {
             {
                 // Handle --net (auto-setup) vs --tap (manual)
                 let (effective_tap, pre_opened_tap_fd, guest_ip) = if net {
-                    match net::auto_setup_network(std::process::id()) {
-                        Ok((tap_name, tap_fd, ip)) => (Some(tap_name), Some(tap_fd), Some(ip)),
+                    let vm_index = match cid {
+                        Some(c) if c >= 3 => (c - 3) as u32,
+                        _ => std::process::id(),
+                    };
+                    match net::auto_setup_network(vm_index) {
+                        Ok((tap_name, tap_fd, alloc)) => {
+                            (Some(tap_name), Some(tap_fd), Some(alloc.guest_ip_bytes))
+                        }
                         Err(e) => {
                             tracing::warn!("Auto network setup failed: {e}");
                             (None, None, None)

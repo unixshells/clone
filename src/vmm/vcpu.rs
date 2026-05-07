@@ -149,31 +149,39 @@ impl Vcpu {
             .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
             .context("Failed to get supported CPUID")?;
 
-        // Minimal CPUID filtering — pass through host features.
         // Minimal CPUID filtering — pass through host features with a few tweaks.
+        //
+        // We *keep* TSC-deadline (CPUID.1.ECX[24]) and kvmclock
+        // (CPUID.0x40000001.EAX[0,3,24]) enabled here. Disabling them
+        // historically masked a fork/restore bug (MSR_KVM_SYSTEM_TIME_NEW not
+        // round-tripping through GET_MSRS) — but the cost was timer
+        // starvation: the guest fell back to TSC clocksource and one-shot
+        // LAPIC, ran without kvmclock-driven calibration, and ended up with
+        // ~6 LAPIC ticks/min on the BSP and zero on idle APs. systemd then
+        // wedged in `synchronize_rcu_normal` because the grace period waits
+        // for every CPU to pass through a quiescent state, which a tickless
+        // idle CPU never does. The fork path handles its own CPUID/MSR
+        // restore in `from_template` below; fresh boots get the host stack.
         for entry in cpuid.as_mut_slice().iter_mut() {
             if entry.function == 0x1 {
                 entry.edx |= 1 << 9; // APIC support (required)
                 entry.edx &= !(1 << 7); // Disable MCE (machine check exception)
                 entry.edx &= !(1 << 14); // Disable MCA (machine check architecture)
-                entry.ecx &= !(1 << 24); // disable TSC-deadline (use one-shot LAPIC)
             }
             if entry.function == 0x7 && entry.index == 0 {
                 entry.ecx &= !(1 << 16); // Disable LA57 (5-level paging)
-            }
-            // Disable kvmclock features — after fork, MSR_KVM_SYSTEM_TIME_NEW
-            // can't be restored (KVM returns 0 for it via get_msrs), so the
-            // guest's pvclock page is never updated and time freezes.
-            // Force the guest to use TSC clocksource instead.
-            if entry.function == 0x40000001 {
-                entry.eax &= !(1 << 0); // KVM_FEATURE_CLOCKSOURCE
-                entry.eax &= !(1 << 3); // KVM_FEATURE_CLOCKSOURCE2
-                entry.eax &= !(1 << 24); // KVM_FEATURE_CLOCKSOURCE_STABLE_BIT
             }
         }
 
         fd.set_cpuid2(&cpuid)
             .context("Failed to set CPUID")?;
+
+        // Pin TSC frequency from the host so the guest doesn't have to
+        // calibrate against PIT/HPET (which our emulation under-delivers on
+        // idle vCPUs). KVM falls back to host frequency if this fails.
+        if let Ok(host_tsc_khz) = fd.get_tsc_khz() {
+            let _ = fd.set_tsc_khz(host_tsc_khz);
+        }
 
         // Set up MSRs — enable MTRRs so the kernel initializes PAT correctly.
         // Without this, the kernel sees "MTRRs disabled" and skips PAT init,

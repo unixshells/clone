@@ -49,7 +49,16 @@ pub struct Serial {
     /// Raw fd of an attached console socket (for `clone attach`).
     /// Serial output is tee'd to this fd when present.
     console_fd: Arc<Mutex<Option<i32>>>,
+
+    /// Recent serial output kept for late `clone attach` clients. The guest
+    /// typically prints the boot banner / login prompt before any client
+    /// connects, and login then sleeps in ppoll without printing anything
+    /// new — without this replay, attach would show an empty screen.
+    output_history: VecDeque<u8>,
 }
+
+/// Maximum bytes of guest serial output retained for replay on attach.
+const HISTORY_CAP: usize = 8 * 1024;
 
 impl Serial {
     /// Create a new serial port with transmitter-empty status.
@@ -71,7 +80,21 @@ impl Serial {
             divisor_low: 0,
             divisor_high: 0,
             console_fd: Arc::new(Mutex::new(None)),
+            output_history: VecDeque::with_capacity(HISTORY_CAP),
         }
+    }
+
+    /// Append a byte to the rolling history, dropping the oldest when full.
+    fn push_history(&mut self, value: u8) {
+        if self.output_history.len() == HISTORY_CAP {
+            self.output_history.pop_front();
+        }
+        self.output_history.push_back(value);
+    }
+
+    /// Drain the history into a contiguous buffer for replay.
+    pub fn snapshot_history(&self) -> Vec<u8> {
+        self.output_history.iter().copied().collect()
     }
 
     /// Handle a read from a port in the COM1 range.
@@ -154,23 +177,29 @@ impl Serial {
                 if self.dlab {
                     self.divisor_low = value;
                 } else {
-                    // Buffer output, flush on newline or when buffer is full
+                    // Tee every byte to the attached console socket immediately —
+                    // a login prompt like `ubuntu login: ` has no trailing newline,
+                    // so a buffer-and-flush-on-\n strategy never delivers it.
+                    // The Unix socket has no tty discipline, so per-byte writes
+                    // are cheap and don't need their own buffering.
+                    if let Ok(guard) = self.console_fd.lock() {
+                        if let Some(fd) = *guard {
+                            let byte = [value];
+                            unsafe {
+                                libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+                            }
+                        }
+                    }
+                    // Keep a rolling copy so a `clone attach` client connecting
+                    // after the boot banner / login prompt was printed still
+                    // sees them.
+                    self.push_history(value);
+                    // For local stdout we keep line buffering so the host TTY
+                    // doesn't get spammed with one-byte writes.
                     self.output_buffer.push(value);
                     if value == b'\n' || self.output_buffer.len() >= 256 {
                         let _ = std::io::stdout().write_all(&self.output_buffer);
                         let _ = std::io::stdout().flush();
-                        // Also write to attached console socket if present
-                        if let Ok(guard) = self.console_fd.lock() {
-                            if let Some(fd) = *guard {
-                                unsafe {
-                                    libc::write(
-                                        fd,
-                                        self.output_buffer.as_ptr() as *const libc::c_void,
-                                        self.output_buffer.len(),
-                                    );
-                                }
-                            }
-                        }
                         self.output_buffer.clear();
                     }
                     // THR is immediately empty again — recalculate IIR so the

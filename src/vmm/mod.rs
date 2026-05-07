@@ -1226,7 +1226,30 @@ impl Vm {
                                         use std::os::unix::io::AsRawFd;
                                         let client_fd = stream.as_raw_fd();
 
-                                        // Register console fd with serial
+                                        // Replay recent serial output so a late attach
+                                        // sees the boot banner / login prompt that was
+                                        // printed before connecting. Then register the
+                                        // client_fd for live tee.
+                                        let history = {
+                                            let serial = serial_for_console.lock().unwrap();
+                                            serial.snapshot_history()
+                                        };
+                                        if !history.is_empty() {
+                                            let mut written = 0;
+                                            while written < history.len() {
+                                                let n = unsafe {
+                                                    libc::write(
+                                                        client_fd,
+                                                        history[written..].as_ptr() as *const libc::c_void,
+                                                        history.len() - written,
+                                                    )
+                                                };
+                                                if n <= 0 {
+                                                    break;
+                                                }
+                                                written += n as usize;
+                                            }
+                                        }
                                         if let Ok(mut guard) = console_fd_handle.lock() {
                                             *guard = Some(client_fd);
                                         }

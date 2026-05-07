@@ -384,6 +384,10 @@ impl VirtioVsock {
     }
 
     fn handle_tx_op(&mut self, op: u16, guest_port: u32, host_port: u32, payload: &[u8], hdr: &VsockHdr) {
+        tracing::info!(
+            "vsock TX op={op} guest_port={guest_port} host_port={host_port} payload_len={}",
+            payload.len()
+        );
         match op {
             OP_REQUEST => {
                 // Guest wants to connect. Close any existing connection first

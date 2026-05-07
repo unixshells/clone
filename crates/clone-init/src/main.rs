@@ -169,7 +169,7 @@ fn main() {
     mount_move("/sys", &format!("{real_root}/sys"));
     mount_move("/dev", &format!("{real_root}/dev"));
 
-    // Copy clone-agent from initrd to rootfs if present
+    // Copy clone-agent from initrd to rootfs if present.
     let agent_initrd = Path::new("/clone-agent");
     if agent_initrd.exists() {
         let agent_dest = format!("{real_root}/usr/local/bin/clone-agent");
@@ -242,17 +242,17 @@ fn main() {
         }
     }
 
-    // Start clone-agent in background before exec'ing init
+    // Start clone-agent in background before exec'ing init. The child is
+    // forked off PID 1 (us) and exec's the agent binary; the agent's main
+    // loop intentionally avoids blocking sleeps because nanosleep/usleep on
+    // a process forked from PID 1 of the initrd doesn't reliably return — a
+    // busy-poll keyed off Instant::elapsed sidesteps that.
     if Path::new("/usr/local/bin/clone-agent").exists() {
-        msg("[clone-init] starting clone-agent");
         #[cfg(target_os = "linux")]
         unsafe {
             let pid = libc::fork();
             if pid == 0 {
-                // Child: become session leader, set up minimal env, exec clone-agent
                 libc::setsid();
-                // Brief delay for vsock device to initialize
-                libc::usleep(50_000); // 50ms
                 let c_path = CString::new("/usr/local/bin/clone-agent").unwrap();
                 let c_argv0 = CString::new("clone-agent").unwrap();
                 let argv: [*const libc::c_char; 2] = [c_argv0.as_ptr(), std::ptr::null()];
@@ -263,11 +263,7 @@ fn main() {
                     c_path_env.as_ptr(), c_home.as_ptr(), c_term.as_ptr(), std::ptr::null()
                 ];
                 libc::execve(c_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
-                // If execve fails, write error marker and exit
-                let _ = fs::write("/tmp/clone-agent-exec-failed", format!("errno: {}", *libc::__errno_location()));
                 libc::_exit(1);
-            } else if pid > 0 {
-                // agent forked successfully
             }
         }
     }

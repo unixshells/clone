@@ -229,6 +229,28 @@ fn parse_identity_ip(data: &[u8]) -> Option<String> {
     Some(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]))
 }
 
+#[cfg(target_os = "linux")]
+fn early_serial_write(s: &str) {
+    unsafe {
+        libc::iopl(3);
+    }
+    for &b in s.as_bytes() {
+        unsafe {
+            for _ in 0..10000 {
+                let lsr: u8;
+                std::arch::asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16);
+                if lsr & 0x20 != 0 {
+                    break;
+                }
+            }
+            std::arch::asm!("out dx, al", in("al") b, in("dx") 0x3F8u16);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn early_serial_write(_s: &str) {}
+
 fn main() {
     eprintln!("clone-agent: starting");
 
@@ -253,7 +275,12 @@ fn main() {
             Some(fd) => fd,
             None => {
                 eprintln!("clone-agent: connect failed, retrying...");
-                std::thread::sleep(Duration::from_millis(100));
+                // sched_yield instead of blocking sleep — see run_agent comment.
+                for _ in 0..1000 {
+                    unsafe {
+                        libc::sched_yield();
+                    }
+                }
                 continue;
             }
         };
@@ -264,10 +291,13 @@ fn main() {
         eprintln!("clone-agent: disconnected, reconnecting...");
 
         // Run reconnect tasks in background — don't block agent readiness.
-        // Network setup and fork cleanup are handled by shell-setup.sh
-        // via exec (vsock), which requires the agent to be available.
         on_reconnect();
-        std::thread::sleep(Duration::from_millis(100));
+        // sched_yield instead of blocking sleep — see run_agent comment.
+        for _ in 0..1000 {
+            unsafe {
+                libc::sched_yield();
+            }
+        }
     }
 }
 
@@ -280,18 +310,18 @@ fn run_agent(fd: i32) {
     let mut last_heartbeat = std::time::Instant::now();
     let heartbeat_interval = Duration::from_secs(2);
 
-    // Set recv timeout to 50ms for fast exec response
-    let tv = libc::timeval { tv_sec: 0, tv_usec: 50_000 };
-    unsafe {
-        libc::setsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
-            &tv as *const libc::timeval as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
-    }
+    // Make the socket non-blocking — we drive the pacing ourselves.
+    set_nonblocking(fd);
 
     loop {
-        // Poll for VMM messages (50ms timeout — fast exec response)
+        // Yield to scheduler without blocking. Forking off PID 1 of the
+        // initrd produces a process where blocking sleeps (nanosleep,
+        // usleep, std::thread::sleep) never wake; a sched_yield-driven busy
+        // poll keeps the loop responsive without consuming a full vCPU.
+        unsafe {
+            libc::sched_yield();
+        }
+        // Poll for VMM messages
         if let Some(msg) = recv_message(fd) {
             match msg {
                 VmmMessage::Poll => {
@@ -362,7 +392,10 @@ fn run_agent(fd: i32) {
                                                 "command timed out after 30s",
                                             ));
                                         }
-                                        std::thread::sleep(Duration::from_millis(10));
+                                        // sched_yield instead of sleep — see run_agent loop.
+                                        unsafe {
+                                            libc::sched_yield();
+                                        }
                                     }
                                     Err(e) => return Err(e),
                                 }
@@ -638,12 +671,26 @@ fn send_message(fd: i32, msg: &AgentMessage) -> Result<(), ()> {
 }
 
 fn recv_message(fd: i32) -> Option<VmmMessage> {
+    // Socket is non-blocking; recv returns -1/EAGAIN when no data is ready.
     let mut len_buf = [0u8; 4];
     let n = unsafe {
-        libc::recv(fd, len_buf.as_mut_ptr() as *mut libc::c_void, 4, 0)
+        libc::recv(
+            fd,
+            len_buf.as_mut_ptr() as *mut libc::c_void,
+            4,
+            libc::MSG_PEEK,
+        )
     };
     if n != 4 {
         return None;
+    }
+    let mut got = 0;
+    while got < 4 {
+        let n = unsafe { libc::recv(fd, len_buf[got..].as_mut_ptr() as *mut libc::c_void, 4 - got, 0) };
+        if n <= 0 {
+            return None;
+        }
+        got += n as usize;
     }
 
     let len = u32::from_le_bytes(len_buf) as usize;

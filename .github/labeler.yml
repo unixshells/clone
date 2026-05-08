@@ -1,0 +1,73 @@
+# actions/labeler@v6 configuration. Each top-level key is a label
+# applied to PRs whose changed files match any of the listed globs.
+# Labels are created on demand by the labeler workflow's setup step,
+# so they don't have to pre-exist in the repo.
+
+'area:ci':
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/workflows/**'
+          - '.github/dependabot.yml'
+          - '.github/labeler.yml'
+          - '.pre-commit-config.yaml'
+          - '.gitleaksignore'
+          - '.commitlintrc.json'
+          - '.markdownlint.json'
+
+'area:docs':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'docs/**'
+          - '*.md'
+          - 'LICENSE'
+          - 'SECURITY.md'
+
+'area:vmm':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/vmm/**'
+          - 'src/control/**'
+          - 'src/main.rs'
+          - 'src/boot/**'
+
+'area:virtio':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/virtio/**'
+
+'area:net':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/net/**'
+
+'area:storage':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'src/storage/**'
+
+'area:tests':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'tests/**'
+
+'area:e2e':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'tests/e2e/**'
+
+'area:deps':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'Cargo.toml'
+          - 'Cargo.lock'
+          - 'crates/**/Cargo.toml'
+          - 'deny.toml'
+
+'area:build':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'Makefile'
+          - 'mise.toml'
+          - 'rust-toolchain.toml'
+          - 'rustfmt.toml'
+          - 'clippy.toml'

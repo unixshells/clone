@@ -1,0 +1,24 @@
+[tools]
+rust = "latest"
+cargo-binstall = "latest"
+pre-commit = "latest"
+
+[tasks.setup]
+description = "Install cargo tools and pre-commit hooks"
+run = """
+cargo binstall -y cargo-audit cargo-deny 2>/dev/null || \
+  cargo install cargo-audit cargo-deny
+pre-commit install
+pre-commit install --hook-type pre-push
+"""
+
+[tasks.ci]
+description = "Run full local CI (same checks as GitHub Actions)"
+run = """
+cargo fmt -- --check
+cargo clippy -- -D warnings
+cargo test
+cargo deny check
+cargo audit
+echo "All local CI checks passed."
+"""

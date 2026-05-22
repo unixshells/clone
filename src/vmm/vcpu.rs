@@ -744,7 +744,7 @@ impl Vcpu {
 
             match action {
                 ExitAction::Hlt => {
-                    std::thread::sleep(Duration::from_millis(1));
+                    std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
                 ExitAction::Shutdown => {

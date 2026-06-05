@@ -356,42 +356,63 @@ pub const DEFAULT_BRIDGE_IP: &str = "172.30.0.1";
 pub const DEFAULT_BRIDGE_CIDR: &str = "172.30.0.0/16";
 pub const DEFAULT_NETMASK: &str = "255.255.0.0";
 
+/// IP allocation for one VM's point-to-point link.
+///
+/// vm_index N → host = 172.30.{N*4/256}.{N*4%256+1}/30, guest = .+1.
+/// Wraps at 16384 to stay within 172.30.0.0/16.
+pub struct NetAllocation {
+    pub host_ip: String,         // gateway from guest's perspective
+    pub guest_ip: String,        // dotted form, e.g. "172.30.0.2"
+    pub guest_ip_bytes: [u8; 4], // [172, 30, x, y]
+    pub prefix: u8,              // always 30
+}
+
+pub fn allocate_subnet(vm_index: u32) -> NetAllocation {
+    let base = (vm_index % 16384) * 4; // 16384 /30 subnets in 172.30.0.0/16
+    let octet_2 = (base / 256) as u8;
+    let host_octet = (base % 256 + 1) as u8;
+    let guest_octet = (base % 256 + 2) as u8;
+    NetAllocation {
+        host_ip: format!("172.30.{octet_2}.{host_octet}"),
+        guest_ip: format!("172.30.{octet_2}.{guest_octet}"),
+        guest_ip_bytes: [172, 30, octet_2, guest_octet],
+        prefix: 30,
+    }
+}
+
 /// Set up point-to-point networking for a VM.
 ///
-/// Each VM gets its own TAP with a /30 subnet (no bridge, no MAC collisions):
-///   vm_index N → host 172.30.{N*4/256}.{N*4%256+1}/30, guest .+1
-///
-/// Returns `(tap_name, tap_fd, guest_ip)`.
+/// Each VM gets its own TAP with a /30 subnet (no bridge, no MAC collisions);
+/// see `allocate_subnet` for the formula.
 #[cfg(target_os = "linux")]
-pub fn auto_setup_network(vm_index: u32) -> anyhow::Result<(String, RawFd, [u8; 4])> {
-    let base = (vm_index % 16384) * 4; // 16384 possible /30 subnets
-    let host_ip = format!("172.30.{}.{}", base / 256, base % 256 + 1);
-    let guest_ip = [172, 30, (base / 256) as u8, (base % 256 + 2) as u8];
-    let guest_ip_str = format!("172.30.{}.{}", base / 256, base % 256 + 2);
-
+pub fn auto_setup_network(vm_index: u32) -> anyhow::Result<(String, RawFd, NetAllocation)> {
+    let alloc = allocate_subnet(vm_index);
     let tap_name = format!("nvm-{}", vm_index);
     let tap_fd = create_tap(&tap_name)?;
 
     // Assign host-side IP directly on the TAP (point-to-point, no bridge)
-    configure_tap(tap_fd, &host_ip, "255.255.255.252")?; // /30
+    configure_tap(tap_fd, &alloc.host_ip, "255.255.255.252")?; // /30
 
     // Enable IP forwarding
     let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
 
     // Add route to guest via this TAP
     let _ = std::process::Command::new("ip")
-        .args(["route", "replace", &format!("{guest_ip_str}/32"), "dev", &tap_name])
+        .args(["route", "replace", &format!("{}/32", alloc.guest_ip), "dev", &tap_name])
         .status();
 
     // Ensure NAT masquerade for outbound
     ensure_nat()?;
 
-    tracing::info!("Point-to-point network: tap={tap_name}, host={host_ip}/30, guest={guest_ip_str}/30");
-    Ok((tap_name, tap_fd, guest_ip))
+    tracing::info!(
+        "Point-to-point network: tap={tap_name}, host={}/{}, guest={}/{}",
+        alloc.host_ip, alloc.prefix, alloc.guest_ip, alloc.prefix
+    );
+    Ok((tap_name, tap_fd, alloc))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn auto_setup_network(_vm_index: u32) -> anyhow::Result<(String, RawFd, [u8; 4])> {
+pub fn auto_setup_network(_vm_index: u32) -> anyhow::Result<(String, RawFd, NetAllocation)> {
     anyhow::bail!("Auto network setup requires Linux");
 }
 

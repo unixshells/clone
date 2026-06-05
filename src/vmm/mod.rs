@@ -369,19 +369,6 @@ impl Vm {
             cmdline.push_str(&format!(" clone.agent_port={}", agent_port));
         }
 
-        // Append guest networking params if TAP is configured but no net params present.
-        // The daemon adds these via its dispatch, but direct `clone run --net` doesn't.
-        if self.config.tap_device.is_some() && !cmdline.contains("clone.net_ip=") {
-            let vsock_cid = self.config.cid.unwrap_or(3);
-            let vm_index = vsock_cid - 3;
-            let host_part = 2 + vm_index;
-            let guest_ip = format!("172.30.{}.{}", host_part / 256, host_part % 256);
-            cmdline.push_str(&format!(
-                " clone.net_ip={} clone.net_gw=172.30.0.1 clone.net_mask=16",
-                guest_ip
-            ));
-        }
-
         for param in &virtio_cmdline_params {
             cmdline.push(' ');
             cmdline.push_str(param);

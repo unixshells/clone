@@ -359,7 +359,9 @@ impl Vcpu {
                         expected,
                     );
                 }
-                fd.set_xsave(&xsave).context("set xsave")?;
+                // SAFETY: `xsave` is a fully-initialized kvm_xsave. kvm-ioctls
+                // 0.24+ marks set_xsave unsafe (the kernel trusts the contents).
+                unsafe { fd.set_xsave(&xsave) }.context("set xsave")?;
             }
         } else if !vcpu_state.fpu.is_empty() {
             let fpu: kvm_bindings::kvm_fpu = restore(&vcpu_state.fpu, "fpu")?;

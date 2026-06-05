@@ -1361,39 +1361,14 @@ pub fn setup_gsi_routing(vm_fd: &VmFd) -> Result<()> {
         entries.push(entry);
     }
 
-    // Allocate kvm_irq_routing with flexible array member
-    let entry_size = std::mem::size_of::<kvm_irq_routing_entry>();
-    let header_size = std::mem::size_of::<kvm_irq_routing>();
-    let total_size = header_size + entries.len() * entry_size;
-
-    let layout = std::alloc::Layout::from_size_align(total_size, 8)
-        .context("Invalid layout for kvm_irq_routing")?;
-
-    // SAFETY: We allocate, zero, fill, pass to ioctl, then dealloc.
-    unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout);
-        if ptr.is_null() {
-            anyhow::bail!("Failed to allocate kvm_irq_routing");
-        }
-
-        let routing = &mut *(ptr as *mut kvm_irq_routing);
-        routing.nr = entries.len() as u32;
-        routing.flags = 0;
-
-        // Copy entries into the flexible array
-        let entries_ptr = routing.entries.as_mut_ptr();
-        for (i, entry) in entries.iter().enumerate() {
-            std::ptr::write(entries_ptr.add(i), *entry);
-        }
-
-        let result = vm_fd
-            .set_gsi_routing(routing)
-            .context("Failed to set GSI routing");
-
-        std::alloc::dealloc(ptr, layout);
-
-        result?;
-    }
+    // Build the FAM-backed kvm_irq_routing via kvm-bindings' fam-wrappers
+    // (kvm-bindings 0.12+ provides KvmIrqRouting; no manual alloc needed).
+    let mut irq_routing = kvm_bindings::KvmIrqRouting::new(entries.len())
+        .context("Failed to allocate kvm_irq_routing")?;
+    irq_routing.as_mut_slice().copy_from_slice(&entries);
+    vm_fd
+        .set_gsi_routing(&irq_routing)
+        .context("Failed to set GSI routing")?;
 
     tracing::info!("GSI routing configured: 24 IOAPIC + 16 PIC entries");
     Ok(())

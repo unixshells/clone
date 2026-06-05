@@ -156,7 +156,7 @@ check_clone_agent() {
     done
 
     if [ -z "$agent" ]; then
-        fail "clone-agent" "not built (cargo build --release --target x86_64-unknown-linux-musl -p clone-agent)"
+        warn "clone-agent" "not prebuilt — lib.sh builds it on demand (or: cargo build --release --target x86_64-unknown-linux-musl -p clone-agent)"
         return
     fi
 

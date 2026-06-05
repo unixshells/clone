@@ -1,0 +1,5 @@
+# Default reviewers for every path. GitHub auto-requests review from
+# these accounts on every PR. Branch protection's "Require review from
+# Code Owners" rule (when enabled in the GitHub UI) gates merges on
+# their approval.
+*       @tolgakaratas @realrasengan

@@ -1,0 +1,71 @@
+name: Lint meta
+
+# Non-Rust repository hygiene: conventional-commits validation on
+# every PR's commit range, and markdownlint over docs and root MD
+# files. Both jobs install their tooling via npm against an explicit
+# Node 24 runtime so the workflow does not pick up any bundled
+# JavaScript actions still pinned to the deprecated Node 20 runtime.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: lint-meta-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  commitlint:
+    name: Commit messages
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Install commitlint
+        run: |
+          npm install --no-save --no-audit --no-fund \
+            @commitlint/cli @commitlint/config-conventional
+      - name: Validate commits in PR
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # actions/checkout@v6 above already clones full history
+          # (fetch-depth: 0); we only need the base ref locally so
+          # commitlint can resolve the "from" symbol.
+          git fetch origin "$BASE_REF"
+          npx commitlint \
+            --from "origin/$BASE_REF" \
+            --to "${{ github.event.pull_request.head.sha }}" \
+            --verbose
+
+  markdownlint:
+    name: Markdown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Install markdownlint-cli2
+        run: npm install --no-save --no-audit --no-fund markdownlint-cli2
+      - name: Run markdownlint over docs + root MDs
+        # Globs match the scope chosen for this repo: every Markdown
+        # file under docs/ and any *.md at the repository root. We
+        # explicitly do NOT walk untracked workspaces (.agents/,
+        # .claude/, target/) because those are gitignored auxiliary
+        # caches, not project documentation.
+        run: |
+          npx markdownlint-cli2 \
+            'docs/**/*.md' \
+            '*.md'

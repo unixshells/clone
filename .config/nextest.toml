@@ -1,0 +1,8 @@
+# nextest profile config. The default profile emits a JUnit XML
+# report alongside the regular console output so CI can publish
+# inline test annotations on PRs (see EnricoMi/publish-unit-test-
+# result-action in build.yml). Path is relative to
+# target/nextest/<profile>/.
+
+[profile.default.junit]
+path = "junit.xml"

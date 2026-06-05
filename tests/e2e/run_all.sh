@@ -13,6 +13,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
+if [ "${SKIP_PREREQS:-0}" != "1" ]; then
+    "$SCRIPT_DIR/check_prereqs.sh" || exit 1
+fi
+
 # ══════════════════════════════════════════════════════════════════════════
 # Test: Basic boot + serial output
 # ══════════════════════════════════════════════════════════════════════════

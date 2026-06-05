@@ -68,7 +68,7 @@ pub fn find_init_binary() -> Result<PathBuf> {
 
     anyhow::bail!(
         "Could not find clone-init binary. Build it with:\n  \
-         cargo build --release -p clone-init\n\
+         cargo build --release -p clone-init --target x86_64-unknown-linux-musl\n
          Or set CLONE_INIT=/path/to/clone-init"
     )
 }

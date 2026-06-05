@@ -9,10 +9,10 @@
 # - Linux kernel 6.5+ with KVM enabled
 #   (kernel 5.15 has a text corruption bug — do NOT use it)
 # - Root access (for KVM, networking, cgroups)
-# - busybox-static, qemu-utils, jq, bc, procps
+# - busybox-static, qemu-utils, jq, bc, procps, socat
 # - For rootfs tests: debootstrap (Ubuntu), wget (Alpine)
 
-sudo apt-get install -y busybox-static qemu-utils jq bc procps debootstrap
+sudo apt-get install -y busybox-static qemu-utils jq bc procps socat debootstrap
 
 # Build Clone + guest components
 cargo build --release

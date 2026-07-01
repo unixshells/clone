@@ -29,7 +29,7 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 
 # cryptography — cross-platform
-sha2 = "0.10"
+sha2 = "0.11"
 
 # rust-vmm crates — Linux only (KVM)
 [target.'cfg(target_os = "linux")'.dependencies]

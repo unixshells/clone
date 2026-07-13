@@ -35,9 +35,9 @@ sha2 = "0.10"
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-ioctls = "0.24"
 kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
-vm-memory = { version = "0.17", features = ["backend-mmap"] }
-linux-loader = { version = "0.13", features = ["bzimage", "elf"] }
-virtio-queue = "0.17"
+vm-memory = { version = "0.18", features = ["backend-mmap"] }
+linux-loader = { version = "0.14", features = ["bzimage", "elf"] }
+virtio-queue = "0.18"
 nix = { version = "0.31", features = ["fs", "ioctl", "mman", "net", "signal", "socket"] }
 io-uring = { version = "0.7", optional = true }
 

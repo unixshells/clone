@@ -45,7 +45,7 @@ jobs:
           ensure 'area:deps'    'f9d0c4' 'Dependencies, Cargo.toml, Cargo.lock'
           ensure 'area:build'   'bfd4f2' 'Build system, toolchain, mise'
 
-      - uses: actions/labeler@v6
+      - uses: actions/labeler@v7
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           configuration-path: .github/labeler.yml

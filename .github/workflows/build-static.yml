@@ -60,8 +60,20 @@ jobs:
           tool: cross
 
       - name: cargo build (static musl) — workspace
+        if: matrix.target != 'aarch64-unknown-linux-musl'
         run: |
           cross build --release --target ${{ matrix.target }} --workspace
+
+      - name: cargo build (static musl) — aarch64, plain cargo + rust-lld
+        # cross's user-mode emulation of aarch64 build scripts dies against
+        # the host glibc (gettid GLIBC_2.30 relocation). Plain cargo compiles
+        # build scripts on the host and links the final binaries against the
+        # musl libc that ships inside the rustup target — self-contained,
+        # no cross gcc or qemu needed.
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          cargo build --release --target aarch64-unknown-linux-musl --workspace \
+            --config 'target.aarch64-unknown-linux-musl.linker="rust-lld"'
 
       - name: static-link sanity check (file + ldd)
         run: |

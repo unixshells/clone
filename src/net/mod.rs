@@ -102,7 +102,7 @@ pub fn create_tap(name: &str) -> anyhow::Result<RawFd> {
     let flags: libc::c_short = IFF_TAP | IFF_NO_PI;
     ifr[16..18].copy_from_slice(&flags.to_ne_bytes());
 
-    let ret = unsafe { libc::ioctl(fd, TUNSETIFF, ifr.as_ptr()) };
+    let ret = unsafe { crate::sys::ioctl(fd, TUNSETIFF as u64, ifr.as_ptr() as *const _ as *mut libc::c_void) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(fd); }
@@ -160,7 +160,7 @@ pub fn configure_tap(fd: RawFd, ip: &str, netmask: &str) -> anyhow::Result<()> {
     // TUNGETIFF to retrieve the interface name.
     const TUNGETIFF: libc::c_ulong = 0x800454D2;
     let mut ifr = [0u8; 40];
-    let ret = unsafe { libc::ioctl(fd, TUNGETIFF, ifr.as_mut_ptr()) };
+    let ret = unsafe { crate::sys::ioctl(fd, TUNGETIFF as u64, ifr.as_mut_ptr() as *const _ as *mut libc::c_void) };
     if ret < 0 {
         unsafe { libc::close(sock); }
         return Err(anyhow::anyhow!(
@@ -194,7 +194,7 @@ pub fn configure_tap(fd: RawFd, ip: &str, netmask: &str) -> anyhow::Result<()> {
     // SIOCSIFADDR = 0x8916
     const SIOCSIFADDR: libc::c_ulong = 0x8916;
     set_sockaddr_in(&mut ifr, &ip_addr);
-    let ret = unsafe { libc::ioctl(sock, SIOCSIFADDR, ifr.as_ptr()) };
+    let ret = unsafe { crate::sys::ioctl(sock, SIOCSIFADDR as u64, ifr.as_ptr() as *const _ as *mut libc::c_void) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(sock); }
@@ -204,7 +204,7 @@ pub fn configure_tap(fd: RawFd, ip: &str, netmask: &str) -> anyhow::Result<()> {
     // SIOCSIFNETMASK = 0x891C
     const SIOCSIFNETMASK: libc::c_ulong = 0x891C;
     set_sockaddr_in(&mut ifr, &netmask_addr);
-    let ret = unsafe { libc::ioctl(sock, SIOCSIFNETMASK, ifr.as_ptr()) };
+    let ret = unsafe { crate::sys::ioctl(sock, SIOCSIFNETMASK as u64, ifr.as_ptr() as *const _ as *mut libc::c_void) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(sock); }
@@ -216,7 +216,7 @@ pub fn configure_tap(fd: RawFd, ip: &str, netmask: &str) -> anyhow::Result<()> {
     const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
 
     // First get current flags.
-    let ret = unsafe { libc::ioctl(sock, SIOCGIFFLAGS, ifr.as_mut_ptr()) };
+    let ret = unsafe { crate::sys::ioctl(sock, SIOCGIFFLAGS as u64, ifr.as_mut_ptr() as *const _ as *mut libc::c_void) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(sock); }
@@ -227,7 +227,7 @@ pub fn configure_tap(fd: RawFd, ip: &str, netmask: &str) -> anyhow::Result<()> {
     let new_flags = current_flags | (libc::IFF_UP as i16);
     ifr[16..18].copy_from_slice(&new_flags.to_ne_bytes());
 
-    let ret = unsafe { libc::ioctl(sock, SIOCSIFFLAGS, ifr.as_ptr()) };
+    let ret = unsafe { crate::sys::ioctl(sock, SIOCSIFFLAGS as u64, ifr.as_ptr() as *const _ as *mut libc::c_void) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(sock); }
@@ -270,7 +270,7 @@ pub fn setup_bridge(bridge_name: &str, tap_name: &str) -> anyhow::Result<()> {
 
     // SIOCGIFINDEX = 0x8933
     const SIOCGIFINDEX: libc::c_ulong = 0x8933;
-    let ret = unsafe { libc::ioctl(sock, SIOCGIFINDEX, ifr.as_mut_ptr()) };
+    let ret = unsafe { crate::sys::ioctl(sock, SIOCGIFINDEX as u64, ifr.as_mut_ptr() as *const _ as *mut libc::c_void) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(sock); }
@@ -287,7 +287,7 @@ pub fn setup_bridge(bridge_name: &str, tap_name: &str) -> anyhow::Result<()> {
 
     // SIOCBRADDIF = 0x89A2
     const SIOCBRADDIF: libc::c_ulong = 0x89A2;
-    let ret = unsafe { libc::ioctl(sock, SIOCBRADDIF, br_ifr.as_ptr()) };
+    let ret = unsafe { crate::sys::ioctl(sock, SIOCBRADDIF as u64, br_ifr.as_ptr() as *const _ as *mut libc::c_void) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(sock); }
@@ -512,7 +512,7 @@ fn bring_interface_up(name: &str) -> anyhow::Result<()> {
     const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
     const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
 
-    let ret = unsafe { libc::ioctl(sock, SIOCGIFFLAGS, ifr.as_mut_ptr()) };
+    let ret = unsafe { crate::sys::ioctl(sock, SIOCGIFFLAGS as u64, ifr.as_mut_ptr() as *const _ as *mut libc::c_void) };
     if ret < 0 {
         unsafe { libc::close(sock) };
         anyhow::bail!("SIOCGIFFLAGS for {name} failed: {}", std::io::Error::last_os_error());
@@ -522,7 +522,7 @@ fn bring_interface_up(name: &str) -> anyhow::Result<()> {
     let new_flags = current_flags | (libc::IFF_UP as i16);
     ifr[16..18].copy_from_slice(&new_flags.to_ne_bytes());
 
-    let ret = unsafe { libc::ioctl(sock, SIOCSIFFLAGS, ifr.as_ptr()) };
+    let ret = unsafe { crate::sys::ioctl(sock, SIOCSIFFLAGS as u64, ifr.as_ptr() as *const _ as *mut libc::c_void) };
     unsafe { libc::close(sock) };
 
     if ret < 0 {

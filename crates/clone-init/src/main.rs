@@ -61,14 +61,16 @@ fn serial_write(s: &str) {
 fn serial_write(_s: &str) {}
 
 /// Call iopl(3) to enable I/O port access for direct serial writes.
-#[cfg(target_os = "linux")]
+/// x86-only syscall: on aarch64 (and any other arch) libc doesn't even
+/// declare it — early serial out there goes through /dev/console instead.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 fn enable_iopl() {
     unsafe {
         libc::iopl(3);
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86"))))]
 fn enable_iopl() {}
 
 fn main() {

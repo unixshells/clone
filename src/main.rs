@@ -1,4 +1,5 @@
 #[cfg(target_os = "linux")]
+mod sys;
 mod vmm;
 #[cfg(target_os = "linux")]
 mod memory;

@@ -683,12 +683,12 @@ impl Vm {
                                 flags: 1, ..Default::default()
                             };
                             let ret = unsafe {
-                                libc::ioctl(self.vm_fd.as_raw_fd(), 0x4040AE79u64 as libc::c_ulong, &ioeventfd)
+                                crate::sys::ioctl(self.vm_fd.as_raw_fd(), 0x4040AE79u64 as u64, &ioeventfd as *const _ as *mut libc::c_void)
                             };
                             if ret != 0 {
                                 ioeventfd.flags = 0;
                                 ioeventfd.datamatch = 0;
-                                unsafe { libc::ioctl(self.vm_fd.as_raw_fd(), 0x4040AE79u64 as libc::c_ulong, &ioeventfd); }
+                                unsafe { crate::sys::ioctl(self.vm_fd.as_raw_fd(), 0x4040AE79u64 as u64, &ioeventfd as *const _ as *mut libc::c_void); }
                             }
                         }
                         self.net_tap_info = Some((tap_fd, dev_index, actual_irq, kick_evt));
@@ -1118,7 +1118,7 @@ impl Vm {
 
         // Run all vCPUs — BSP on main thread, APs on spawned threads.
         let mut ap_handles = Vec::new();
-        let mut vcpu_threads: Vec<libc::pthread_t> = Vec::new();
+        let mut vcpu_threads: Vec<usize> = Vec::new();
 
         // Drain vCPUs: take APs first (index 1+), then BSP (index 0) runs on main thread.
         let mut all_vcpus: Vec<vcpu::Vcpu> = self.vcpus.drain(..).collect();
@@ -1126,12 +1126,12 @@ impl Vm {
         // Spawn AP threads (vCPU 1, 2, ...) and capture their pthread_t handles
         for vcpu in all_vcpus.drain(1..) {
             // Use a channel to get the pthread_t from inside the spawned thread
-            let (tx, rx) = std::sync::mpsc::channel::<libc::pthread_t>();
+            let (tx, rx) = std::sync::mpsc::channel::<usize>();
             let handle = std::thread::Builder::new()
                 .name(format!("vcpu-{}", vcpu.id()))
                 .spawn(move || {
                     // Send our pthread_t to the main thread
-                    let _ = tx.send(unsafe { libc::pthread_self() });
+                    let _ = tx.send(unsafe { libc::pthread_self() } as usize);
                     let mut vcpu = vcpu;
                     if let Err(e) = vcpu.run_loop() {
                         tracing::error!("vCPU {} exited with error: {e}", vcpu.id());
@@ -1146,7 +1146,7 @@ impl Vm {
         }
 
         // BSP (vCPU 0) runs on the main thread — store its pthread_t
-        let bsp_tid = unsafe { libc::pthread_self() };
+        let bsp_tid = unsafe { libc::pthread_self() } as usize;
         // Insert BSP at front so vcpu_threads[0] = BSP
         vcpu_threads.insert(0, bsp_tid);
 

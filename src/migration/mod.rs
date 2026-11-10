@@ -433,7 +433,7 @@ pub fn run_sender(
     // Resume vCPUs so they can exit
     crate::control::sync_server::resume_vcpus_pub(vm);
     for &tid in &vm.vcpu_threads {
-        unsafe { libc::pthread_kill(tid, libc::SIGUSR1); }
+        unsafe { libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1); }
     }
 
     Ok(stats)
@@ -644,17 +644,17 @@ pub fn run_receiver(
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let _agent_state = crate::vmm::agent_listener::start_listener(Arc::clone(&shutdown_flag), crate::vmm::agent_listener::AGENT_VSOCK_PORT_BASE);
 
-    let mut vcpu_threads: Vec<libc::pthread_t> = Vec::new();
+    let mut vcpu_threads: Vec<usize> = Vec::new();
     let mut ap_handles = Vec::new();
 
     let mut all_vcpus: Vec<crate::vmm::vcpu::Vcpu> = vcpus.drain(..).collect();
 
     for vcpu in all_vcpus.drain(1..) {
-        let (tx, rx) = std::sync::mpsc::channel::<libc::pthread_t>();
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
         let handle = std::thread::Builder::new()
             .name(format!("vcpu-{}", vcpu.id()))
             .spawn(move || {
-                let _ = tx.send(unsafe { libc::pthread_self() });
+                let _ = tx.send(unsafe { libc::pthread_self() } as usize);
                 let mut vcpu = vcpu;
                 if let Err(e) = vcpu.run_loop() {
                     tracing::error!("vCPU {} exited with error: {e}", vcpu.id());
@@ -666,7 +666,7 @@ pub fn run_receiver(
         ap_handles.push(handle);
     }
 
-    let bsp_tid = unsafe { libc::pthread_self() };
+    let bsp_tid = unsafe { libc::pthread_self() } as usize;
     vcpu_threads.insert(0, bsp_tid);
 
     let vm_handle = Arc::new(crate::control::sync_server::VmHandle {

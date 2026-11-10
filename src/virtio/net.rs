@@ -262,7 +262,7 @@ impl VirtioNet {
         self.vhost_fd = vhost_fd;
 
         // 2. VHOST_SET_OWNER
-        let ret = unsafe { libc::ioctl(vhost_fd, vhost::SET_OWNER) };
+        let ret = unsafe { crate::sys::ioctl(vhost_fd, vhost::SET_OWNER as u64, std::ptr::null_mut()) };
         if ret < 0 {
             return Err(anyhow::anyhow!(
                 "VHOST_SET_OWNER failed: {}",
@@ -273,11 +273,7 @@ impl VirtioNet {
         // 3. VHOST_GET_FEATURES then SET intersection with driver-negotiated features
         let mut vhost_features: u64 = 0;
         if unsafe {
-            libc::ioctl(
-                vhost_fd,
-                vhost::GET_FEATURES,
-                &mut vhost_features as *mut u64,
-            )
+            crate::sys::ioctl(vhost_fd, vhost::GET_FEATURES as u64, &mut vhost_features as *mut u64 as *const _ as *mut libc::c_void)
         } < 0
         {
             return Err(anyhow::anyhow!(
@@ -301,7 +297,7 @@ impl VirtioNet {
             features
         );
 
-        if unsafe { libc::ioctl(vhost_fd, vhost::SET_FEATURES, &features as *const u64) } < 0 {
+        if unsafe { crate::sys::ioctl(vhost_fd, vhost::SET_FEATURES as u64, &features as *const u64 as *const _ as *mut libc::c_void) } < 0 {
             return Err(anyhow::anyhow!(
                 "VHOST_SET_FEATURES failed: {}",
                 std::io::Error::last_os_error()
@@ -329,7 +325,7 @@ impl VirtioNet {
                     },
                 ],
             };
-            unsafe { libc::ioctl(vhost_fd, vhost::SET_MEM_TABLE, &mem_table as *const vhost::Memory2) }
+            unsafe { crate::sys::ioctl(vhost_fd, vhost::SET_MEM_TABLE as u64, &mem_table as *const vhost::Memory2 as *const _ as *mut libc::c_void) }
         } else {
             let mem_table = vhost::Memory {
                 nregions: 1,
@@ -341,10 +337,7 @@ impl VirtioNet {
                     flags_padding: 0,
                 }],
             };
-            unsafe { libc::ioctl(vhost_fd,
-                vhost::SET_MEM_TABLE,
-                &mem_table as *const vhost::Memory,
-            ) }
+            unsafe { crate::sys::ioctl(vhost_fd, vhost::SET_MEM_TABLE as u64, &mem_table as *const vhost::Memory as *const _ as *mut libc::c_void) }
         };
         if ret < 0 {
             return Err(anyhow::anyhow!(
@@ -378,7 +371,7 @@ impl VirtioNet {
                 index: qi,
                 num: qc.size as u32,
             };
-            if unsafe { libc::ioctl(vhost_fd, vhost::SET_VRING_NUM, &state) } < 0 {
+            if unsafe { crate::sys::ioctl(vhost_fd, vhost::SET_VRING_NUM as u64, &state as *const _ as *mut libc::c_void) } < 0 {
                 return Err(anyhow::anyhow!(
                     "VHOST_SET_VRING_NUM(q={qi}) failed: {}",
                     std::io::Error::last_os_error()
@@ -394,7 +387,7 @@ impl VirtioNet {
                 avail_user_addr: self.gpa_to_hva(qc.avail_addr),
                 log_guest_addr: 0,
             };
-            if unsafe { libc::ioctl(vhost_fd, vhost::SET_VRING_ADDR, &addr) } < 0 {
+            if unsafe { crate::sys::ioctl(vhost_fd, vhost::SET_VRING_ADDR as u64, &addr as *const _ as *mut libc::c_void) } < 0 {
                 return Err(anyhow::anyhow!(
                     "VHOST_SET_VRING_ADDR(q={qi}) failed: {}",
                     std::io::Error::last_os_error()
@@ -415,7 +408,7 @@ impl VirtioNet {
                 index: qi,
                 num: avail_idx,
             };
-            if unsafe { libc::ioctl(vhost_fd, vhost::SET_VRING_BASE, &base) } < 0 {
+            if unsafe { crate::sys::ioctl(vhost_fd, vhost::SET_VRING_BASE as u64, &base as *const _ as *mut libc::c_void) } < 0 {
                 return Err(anyhow::anyhow!(
                     "VHOST_SET_VRING_BASE(q={qi}, avail_idx={avail_idx}) failed: {}",
                     std::io::Error::last_os_error()
@@ -427,7 +420,7 @@ impl VirtioNet {
                 index: qi,
                 fd: kick_fd,
             };
-            if unsafe { libc::ioctl(vhost_fd, vhost::SET_VRING_KICK, &kick) } < 0 {
+            if unsafe { crate::sys::ioctl(vhost_fd, vhost::SET_VRING_KICK as u64, &kick as *const _ as *mut libc::c_void) } < 0 {
                 return Err(anyhow::anyhow!(
                     "VHOST_SET_VRING_KICK(q={qi}) failed: {}",
                     std::io::Error::last_os_error()
@@ -439,7 +432,7 @@ impl VirtioNet {
                 index: qi,
                 fd: call_fd,
             };
-            if unsafe { libc::ioctl(vhost_fd, vhost::SET_VRING_CALL, &call) } < 0 {
+            if unsafe { crate::sys::ioctl(vhost_fd, vhost::SET_VRING_CALL as u64, &call as *const _ as *mut libc::c_void) } < 0 {
                 return Err(anyhow::anyhow!(
                     "VHOST_SET_VRING_CALL(q={qi}) failed: {}",
                     std::io::Error::last_os_error()
@@ -451,7 +444,7 @@ impl VirtioNet {
                 index: qi,
                 fd: self.tap_fd,
             };
-            if unsafe { libc::ioctl(vhost_fd, vhost::NET_SET_BACKEND, &backend) } < 0 {
+            if unsafe { crate::sys::ioctl(vhost_fd, vhost::NET_SET_BACKEND as u64, &backend as *const _ as *mut libc::c_void) } < 0 {
                 return Err(anyhow::anyhow!(
                     "VHOST_NET_SET_BACKEND(q={qi}) failed: {}",
                     std::io::Error::last_os_error()

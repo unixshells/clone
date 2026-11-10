@@ -36,8 +36,10 @@ fn msg(s: &str) {
 }
 
 /// Write a string directly to COM1 (I/O port 0x3F8) using port I/O.
-/// Requires iopl(3) to have been called first.
-#[cfg(target_os = "linux")]
+/// Requires iopl(3) to have been called first. x86-only: port I/O has no
+/// arm64 equivalent (guest earlycon there is PL011 MMIO, reachable via
+/// /dev/console once the kernel has it mapped).
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 fn serial_write(s: &str) {
     for &b in s.as_bytes() {
         // Wait for THR empty (LSR bit 5)
@@ -57,7 +59,7 @@ fn serial_write(s: &str) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86"))))]
 fn serial_write(_s: &str) {}
 
 /// Call iopl(3) to enable I/O port access for direct serial writes.

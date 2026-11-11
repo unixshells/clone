@@ -1,4 +1,5 @@
 #[cfg(target_os = "linux")]
+mod sys;
 mod vmm;
 #[cfg(target_os = "linux")]
 mod memory;
@@ -453,7 +454,15 @@ fn main() -> Result<()> {
                     let init_binary = rootfs::find_init_binary()?;
                     tracing::info!("Using init binary: {}", init_binary.display());
 
-                    let initrd_bytes = rootfs::generate_initrd(&init_binary)?;
+                    // Guest kernel version from the --kernel filename
+                    // (e.g. vmlinuz-7.3.3+deb14-arm64) so the initrd embeds
+                    // modules for the GUEST, not the host.
+                    let kernel_version = std::path::Path::new(&kernel)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .and_then(|f| f.strip_prefix("vmlinuz-"))
+                        .map(str::to_string);
+                    let initrd_bytes = rootfs::generate_initrd(&init_binary, kernel_version.as_deref())?;
 
                     // Write generated initrd to a temp file
                     let initrd_path = std::env::temp_dir().join(format!(

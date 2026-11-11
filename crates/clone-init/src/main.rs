@@ -36,8 +36,10 @@ fn msg(s: &str) {
 }
 
 /// Write a string directly to COM1 (I/O port 0x3F8) using port I/O.
-/// Requires iopl(3) to have been called first.
-#[cfg(target_os = "linux")]
+/// Requires iopl(3) to have been called first. x86-only: port I/O has no
+/// arm64 equivalent (guest earlycon there is PL011 MMIO, reachable via
+/// /dev/console once the kernel has it mapped).
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 fn serial_write(s: &str) {
     for &b in s.as_bytes() {
         // Wait for THR empty (LSR bit 5)
@@ -57,18 +59,20 @@ fn serial_write(s: &str) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86"))))]
 fn serial_write(_s: &str) {}
 
 /// Call iopl(3) to enable I/O port access for direct serial writes.
-#[cfg(target_os = "linux")]
+/// x86-only syscall: on aarch64 (and any other arch) libc doesn't even
+/// declare it — early serial out there goes through /dev/console instead.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
 fn enable_iopl() {
     unsafe {
         libc::iopl(3);
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86"))))]
 fn enable_iopl() {}
 
 fn main() {
@@ -105,6 +109,22 @@ fn main() {
     // overlay.ko is always needed for rootfs overlay mode
     if Path::new("/lib/modules/overlay.ko").exists() {
         load_module("/lib/modules/overlay.ko");
+    }
+    // Boot-critical modules for kernels where ext4/virtio are =m (Debian
+    // arm64). Dependency order matters: crc32c -> crc16 -> jbd2 -> mbcache
+    // -> ext4; virtio_mmio/virtio_blk have no deps (core virtio built-in).
+    for module in &[
+        "/lib/modules/crc32c-cryptoapi.ko",
+        "/lib/modules/crc16.ko",
+        "/lib/modules/jbd2.ko",
+        "/lib/modules/mbcache.ko",
+        "/lib/modules/ext4.ko",
+        "/lib/modules/virtio_mmio.ko",
+        "/lib/modules/virtio_blk.ko",
+    ] {
+        if Path::new(module).exists() {
+            load_module(module);
+        }
     }
 
     // Parse kernel command line

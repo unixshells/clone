@@ -45,8 +45,15 @@ fn default_allowed_syscalls() -> Vec<i32> {
 
 #[cfg(target_os = "linux")]
 mod linux_syscalls {
-    /// x86_64 syscall numbers the VMM needs.
+    /// x86_64 syscall numbers the VMM needs (plus arch-specific additions).
     pub fn default_allowed() -> Vec<i32> {
+        let mut v = base_allowed();
+        v.extend(arch_specific());
+        v
+    }
+
+    /// Portable syscall base set (present on x86_64, arm64 and arm32).
+    pub fn base_allowed() -> Vec<i32> {
         vec![
             // KVM ioctls
             libc::SYS_ioctl as i32,
@@ -101,16 +108,13 @@ mod linux_syscalls {
             libc::SYS_set_robust_list as i32,
             libc::SYS_get_robust_list as i32,
             libc::SYS_prctl as i32,
-            libc::SYS_arch_prctl as i32,
             libc::SYS_clone as i32,
             libc::SYS_clone3 as i32,
             libc::SYS_wait4 as i32,
             // Epoll
             libc::SYS_epoll_create1 as i32,
             libc::SYS_epoll_ctl as i32,
-            libc::SYS_epoll_wait as i32,
             libc::SYS_epoll_pwait as i32,
-            libc::SYS_poll as i32,
             libc::SYS_eventfd2 as i32,
             libc::SYS_timerfd_create as i32,
             libc::SYS_timerfd_settime as i32,
@@ -134,6 +138,22 @@ mod linux_syscalls {
             libc::SYS_getcwd as i32,
             libc::SYS_chdir as i32,
         ]
+    }
+
+    /// Arch-specific additions (x86_64: arch_prctl; pre-epoll_pwait poll).
+    pub fn arch_specific() -> Vec<i32> {
+        let mut v = Vec::new();
+        #[cfg(target_arch = "x86_64")]
+        v.push(libc::SYS_arch_prctl as i32);
+        #[cfg(target_arch = "x86_64")]
+        v.push(libc::SYS_epoll_wait as i32);
+        #[cfg(target_arch = "x86_64")]
+        v.push(libc::SYS_poll as i32);
+        #[cfg(target_arch = "arm")]
+        v.push(libc::SYS_epoll_wait as i32);
+        #[cfg(target_arch = "arm")]
+        v.push(libc::SYS_poll as i32);
+        v
     }
 }
 

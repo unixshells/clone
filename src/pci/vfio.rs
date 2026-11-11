@@ -143,20 +143,20 @@ impl VfioDevice {
             .context("Failed to open /dev/vfio/vfio")?;
 
         // Check API version
-        let version = unsafe { libc::ioctl(container_fd, VFIO_GET_API_VERSION as libc::c_ulong) };
+        let version = unsafe { crate::sys::ioctl(container_fd, VFIO_GET_API_VERSION as u64, std::ptr::null_mut()) };
         if version != VFIO_API_VERSION as i32 {
             anyhow::bail!("VFIO API version mismatch: got {version}, expected {VFIO_API_VERSION}");
         }
 
         // Check IOMMU support
         let has_type1v2 = unsafe {
-            libc::ioctl(container_fd, VFIO_CHECK_EXTENSION as libc::c_ulong, VFIO_TYPE1V2_IOMMU)
+            crate::sys::ioctl_value(container_fd, VFIO_CHECK_EXTENSION as u64, VFIO_TYPE1V2_IOMMU as u64)
         };
         let iommu_type = if has_type1v2 > 0 {
             VFIO_TYPE1V2_IOMMU
         } else {
             let has_type1 = unsafe {
-                libc::ioctl(container_fd, VFIO_CHECK_EXTENSION as libc::c_ulong, VFIO_TYPE1_IOMMU)
+                crate::sys::ioctl_value(container_fd, VFIO_CHECK_EXTENSION as u64, VFIO_TYPE1_IOMMU as u64)
             };
             if has_type1 <= 0 {
                 anyhow::bail!("No supported VFIO IOMMU type found");
@@ -172,7 +172,7 @@ impl VfioDevice {
         // Check group is viable
         let mut status = VfioGroupStatus { argsz: 8, flags: 0 };
         let ret = unsafe {
-            libc::ioctl(group_fd, VFIO_GROUP_GET_STATUS as libc::c_ulong, &mut status)
+            crate::sys::ioctl(group_fd, VFIO_GROUP_GET_STATUS as u64, &mut status as *const _ as *mut libc::c_void)
         };
         if ret < 0 {
             anyhow::bail!("VFIO_GROUP_GET_STATUS failed: {}", std::io::Error::last_os_error());
@@ -186,7 +186,7 @@ impl VfioDevice {
 
         // 4. Set container for group
         let ret = unsafe {
-            libc::ioctl(group_fd, VFIO_GROUP_SET_CONTAINER as libc::c_ulong, &container_fd)
+            crate::sys::ioctl(group_fd, VFIO_GROUP_SET_CONTAINER as u64, &container_fd as *const _ as *mut libc::c_void)
         };
         if ret < 0 {
             anyhow::bail!("VFIO_GROUP_SET_CONTAINER failed: {}", std::io::Error::last_os_error());
@@ -194,7 +194,7 @@ impl VfioDevice {
 
         // 5. Set IOMMU type
         let ret = unsafe {
-            libc::ioctl(container_fd, VFIO_SET_IOMMU as libc::c_ulong, iommu_type)
+            crate::sys::ioctl_value(container_fd, VFIO_SET_IOMMU as u64, iommu_type as u64)
         };
         if ret < 0 {
             anyhow::bail!("VFIO_SET_IOMMU failed: {}", std::io::Error::last_os_error());
@@ -203,7 +203,7 @@ impl VfioDevice {
         // 6. Get device fd
         let bdf_cstr = std::ffi::CString::new(bdf)?;
         let device_fd = unsafe {
-            libc::ioctl(group_fd, VFIO_GROUP_GET_DEVICE_FD as libc::c_ulong, bdf_cstr.as_ptr())
+            crate::sys::ioctl(group_fd, VFIO_GROUP_GET_DEVICE_FD as u64, bdf_cstr.as_ptr() as *const _ as *mut libc::c_void)
         };
         if device_fd < 0 {
             anyhow::bail!(
@@ -220,7 +220,7 @@ impl VfioDevice {
             num_irqs: 0,
         };
         let ret = unsafe {
-            libc::ioctl(device_fd, VFIO_DEVICE_GET_INFO as libc::c_ulong, &mut dev_info)
+            crate::sys::ioctl(device_fd, VFIO_DEVICE_GET_INFO as u64, &mut dev_info as *const _ as *mut libc::c_void)
         };
         if ret < 0 {
             anyhow::bail!("VFIO_DEVICE_GET_INFO failed: {}", std::io::Error::last_os_error());
@@ -242,7 +242,7 @@ impl VfioDevice {
                 offset: 0,
             };
             let ret = unsafe {
-                libc::ioctl(device_fd, VFIO_DEVICE_GET_REGION_INFO as libc::c_ulong, &mut region)
+                crate::sys::ioctl(device_fd, VFIO_DEVICE_GET_REGION_INFO as u64, &mut region as *const _ as *mut libc::c_void)
             };
             if ret < 0 {
                 tracing::warn!("Failed to get region {i} info");
@@ -278,7 +278,7 @@ impl VfioDevice {
         };
 
         let ret = unsafe {
-            libc::ioctl(self.container_fd, VFIO_IOMMU_MAP_DMA as libc::c_ulong, &dma_map)
+            crate::sys::ioctl(self.container_fd, VFIO_IOMMU_MAP_DMA as u64, &dma_map as *const _ as *mut libc::c_void)
         };
         if ret < 0 {
             anyhow::bail!(
@@ -410,7 +410,7 @@ impl VfioDevice {
     /// Reset the device.
     pub fn reset(&self) -> Result<()> {
         let ret = unsafe {
-            libc::ioctl(self.device_fd, VFIO_DEVICE_RESET as libc::c_ulong)
+            crate::sys::ioctl(self.device_fd, VFIO_DEVICE_RESET as u64, std::ptr::null_mut())
         };
         if ret < 0 {
             tracing::warn!("VFIO device reset failed: {}", std::io::Error::last_os_error());

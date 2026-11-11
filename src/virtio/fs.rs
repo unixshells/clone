@@ -1777,7 +1777,7 @@ impl VirtioFs {
                     Err(_) => return self.make_error_response(header.unique, -libc::EINVAL),
                 };
                 let ret = unsafe {
-                    libc::renameat2(
+                    crate::sys::renameat2(
                         libc::AT_FDCWD,
                         c_old.as_ptr(),
                         libc::AT_FDCWD,

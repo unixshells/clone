@@ -433,7 +433,7 @@ pub fn run_sender(
     // Resume vCPUs so they can exit
     crate::control::sync_server::resume_vcpus_pub(vm);
     for &tid in &vm.vcpu_threads {
-        unsafe { libc::pthread_kill(tid, libc::SIGUSR1); }
+        unsafe { libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1); }
     }
 
     Ok(stats)
@@ -453,10 +453,9 @@ pub fn run_receiver(
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    use kvm_bindings::{
-        kvm_pit_config, kvm_userspace_memory_region,
-        KVM_MEM_LOG_DIRTY_PAGES, KVM_PIT_SPEAKER_DUMMY,
-    };
+    use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
+    #[cfg(target_arch = "x86_64")]
+    use kvm_bindings::{kvm_pit_config, KVM_PIT_SPEAKER_DUMMY};
     use kvm_ioctls::Kvm;
 
     let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
@@ -500,14 +499,17 @@ pub fn run_receiver(
             .context("Failed to set KVM memory region")?;
     }
 
-    // Create irqchip + PIT + GSI routing
-    vm_fd.create_irq_chip().context("Failed to create irqchip")?;
-    let pit_config = kvm_pit_config {
-        flags: KVM_PIT_SPEAKER_DUMMY,
-        ..Default::default()
-    };
-    vm_fd.create_pit2(pit_config).context("Failed to create PIT")?;
-    crate::vmm::setup_gsi_routing(&vm_fd)?;
+    // Create irqchip + PIT + GSI routing (x86 only)
+    #[cfg(target_arch = "x86_64")]
+    {
+        vm_fd.create_irq_chip().context("Failed to create irqchip")?;
+        let pit_config = kvm_pit_config {
+            flags: KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        };
+        vm_fd.create_pit2(pit_config).context("Failed to create PIT")?;
+        crate::vmm::setup_gsi_routing(&vm_fd)?;
+    }
 
     // Send Ready
     write_msg(&mut stream, MSG_READY, &[])?;
@@ -644,17 +646,17 @@ pub fn run_receiver(
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let _agent_state = crate::vmm::agent_listener::start_listener(Arc::clone(&shutdown_flag), crate::vmm::agent_listener::AGENT_VSOCK_PORT_BASE);
 
-    let mut vcpu_threads: Vec<libc::pthread_t> = Vec::new();
+    let mut vcpu_threads: Vec<usize> = Vec::new();
     let mut ap_handles = Vec::new();
 
     let mut all_vcpus: Vec<crate::vmm::vcpu::Vcpu> = vcpus.drain(..).collect();
 
     for vcpu in all_vcpus.drain(1..) {
-        let (tx, rx) = std::sync::mpsc::channel::<libc::pthread_t>();
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
         let handle = std::thread::Builder::new()
             .name(format!("vcpu-{}", vcpu.id()))
             .spawn(move || {
-                let _ = tx.send(unsafe { libc::pthread_self() });
+                let _ = tx.send(unsafe { libc::pthread_self() } as usize);
                 let mut vcpu = vcpu;
                 if let Err(e) = vcpu.run_loop() {
                     tracing::error!("vCPU {} exited with error: {e}", vcpu.id());
@@ -666,7 +668,7 @@ pub fn run_receiver(
         ap_handles.push(handle);
     }
 
-    let bsp_tid = unsafe { libc::pthread_self() };
+    let bsp_tid = unsafe { libc::pthread_self() } as usize;
     vcpu_threads.insert(0, bsp_tid);
 
     let vm_handle = Arc::new(crate::control::sync_server::VmHandle {

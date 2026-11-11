@@ -1,0 +1,96 @@
+name: build-static
+
+# Reproducible musl static builds for `clone` + its guest-side helpers.
+#
+# The workflow never runs on our own hosts: GitHub Actions runners carry the
+# toolchain (rustup targets + cross-rs toolchain container), so developer
+# giga machines stay clean of rust toolchain installs entirely.
+#
+# Targets:
+#   x86_64-unknown-linux-musl     static x86_64 host builds
+#   aarch64-unknown-linux-musl    static arm64 thin-Dom0 host builds (current phone EL2 kernel 5.10)
+#   arm-unknown-linux-musleabihf  static arm32 (experimental; the VMM core is x86-only so this will
+#                                  stay red until the arm32 port lands in-tree)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  musl-static:
+    name: static ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            experimental: false
+          - target: aarch64-unknown-linux-musl
+            experimental: false
+          - target: arm-unknown-linux-musleabihf
+            experimental: true
+
+    steps:
+      - name: Checkout ${{ github.repository }} @ ${{ github.sha }}
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable + ${{ matrix.target }} target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-v1-${{ matrix.target }}
+          restore-keys: ${{ runner.os }}-cargo-v1-
+
+      - name: cross-rs setup
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: cargo build (static musl) — workspace
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: |
+          cross build --release --target ${{ matrix.target }} --workspace
+
+      - name: cargo build (static musl) — aarch64, plain cargo + rust-lld
+        # cross's user-mode emulation of aarch64 build scripts dies against
+        # the host glibc (gettid GLIBC_2.30 relocation). Plain cargo compiles
+        # build scripts on the host and links the final binaries against the
+        # musl libc that ships inside the rustup target — self-contained,
+        # no cross gcc or qemu needed.
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          cargo build --release --target aarch64-unknown-linux-musl --workspace \
+            --config 'target.aarch64-unknown-linux-musl.linker="rust-lld"'
+
+      - name: static-link sanity check (file + ldd)
+        run: |
+          for b in clone clone-init clone-agent; do
+            f=target/${{ matrix.target }}/release/$b
+            if [ -f "$f" ]; then
+              echo "== $b =="
+              file "$f"
+              if command -v ldd >/dev/null; then ldd "$f" || true; fi
+            else
+              echo "MISSING expected binary: $f"
+            fi
+          done
+
+      - name: Upload artifact — ${{ matrix.target }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: clone-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/clone*
+          if-no-files-found: warn

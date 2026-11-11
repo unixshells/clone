@@ -115,6 +115,8 @@ pub struct MmioTransport {
     guest_mem: *mut u8,
     /// Guest memory size in bytes.
     guest_mem_size: u64,
+    /// GPA of the start of the mapped region (0 on x86, RAM_BASE on arm64).
+    mem_base: u64,
     /// External interrupt status from vhost call_fd poll thread.
     /// Set atomically by the poll thread, read and cleared by the transport.
     vhost_interrupt: Arc<AtomicU32>,
@@ -173,6 +175,7 @@ impl MmioTransport {
             config_generation: 0,
             guest_mem,
             guest_mem_size,
+            mem_base: 0,
             vhost_interrupt: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -200,6 +203,18 @@ impl MmioTransport {
                 q
             })
             .collect();
+    }
+
+    /// Set the GPA of the start of the mapped guest memory region
+    /// (arm64: RAM_BASE, since guest RAM starts at 0x40000000). Must be
+    /// called after set_guest_memory_with_hole. Propagates to all
+    /// virtqueues and to the device.
+    pub fn set_mem_base(&mut self, mem_base: u64) {
+        self.mem_base = mem_base;
+        for q in &mut self.virtqueues {
+            q.set_mem_base(mem_base);
+        }
+        self.device.set_mem_base(mem_base);
     }
 
     /// Reset the device to initial state.
@@ -386,6 +401,11 @@ impl MmioTransport {
             }
             reg::QUEUE_NOTIFY => {
                 let queue_idx = val as u16;
+                tracing::info!(
+                    "virtio-mmio QUEUE_NOTIFY q={queue_idx} dev={:?} ready={}",
+                    self.device.device_type(),
+                    self.virtqueues.get(queue_idx as usize).map(|q| q.is_ready()).unwrap_or(false)
+                );
                 if let Err(e) = self.device.process_queue(queue_idx) {
                     tracing::error!("Error processing queue {val}: {e}");
                 }
@@ -731,6 +751,14 @@ impl MmioBus {
         }
     }
 
+    /// Set the GPA of the start of the mapped guest memory region
+    /// (0 on x86 where guest RAM starts at GPA 0; RAM_BASE on arm64).
+    pub fn set_mem_base(&mut self, mem_base: u64) {
+        for transport in &mut self.devices {
+            transport.set_mem_base(mem_base);
+        }
+    }
+
     /// Register a virtio device on the bus. Returns the MMIO base address
     /// and IRQ number assigned to it.
     pub fn register(&mut self, device: Box<dyn VirtioDevice>) -> (u64, u32) {
@@ -775,6 +803,9 @@ impl MmioBus {
             } else {
                 None
             };
+            tracing::info!(
+                "virtio-mmio write addr={addr:#x} off={offset:#x} had={had_interrupt} has={has_interrupt} inject={inject:?}"
+            );
             (true, inject)
         } else {
             (false, None)

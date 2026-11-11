@@ -78,6 +78,8 @@ pub struct VirtioBalloon {
     /// to host pointers for `madvise`.
     guest_mem_base: *mut u8,
     guest_mem_size: u64,
+    /// GPA of the start of the mapped region (0 on x86, RAM_BASE on arm64).
+    mem_base: u64,
 
     /// Whether the device has been activated by the driver.
     activated: bool,
@@ -104,6 +106,7 @@ impl VirtioBalloon {
             acked_features: 0,
             guest_mem_base,
             guest_mem_size,
+            mem_base: 0,
             activated: false,
             config_interrupt_pending: false,
         }
@@ -134,8 +137,10 @@ impl VirtioBalloon {
 
         let mut inflated = 0u32;
         for &pfn in pfns {
-            let guest_addr = pfn as u64 * BALLOON_PAGE_SIZE as u64;
-            if guest_addr + BALLOON_PAGE_SIZE as u64 > self.guest_mem_size {
+            // Guest PFNs are GPAs relative to mem_base (0 on x86, RAM_BASE
+            // on arm64 where guest RAM starts at 0x40000000).
+            let guest_addr = self.mem_base + pfn as u64 * BALLOON_PAGE_SIZE as u64;
+            if guest_addr + BALLOON_PAGE_SIZE as u64 > self.mem_base + self.guest_mem_size {
                 tracing::warn!(pfn, "inflate: PFN out of range, skipping");
                 continue;
             }
@@ -338,6 +343,9 @@ impl VirtioDevice for VirtioBalloon {
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+    fn set_mem_base(&mut self, mem_base: u64) {
+        self.mem_base = mem_base;
+    }
     fn reset(&mut self) {
         self.config.num_pages.store(0, Ordering::Release);
         self.config.actual.store(0, Ordering::Release);

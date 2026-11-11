@@ -5,17 +5,21 @@ pub mod vcpu;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+#[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    kvm_pit_config, kvm_userspace_memory_region,
+    kvm_pit_config,
     kvm_irq_routing, kvm_irq_routing_entry,
     KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQCHIP_IOAPIC,
     KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_PIT_SPEAKER_DUMMY, KVM_MEM_LOG_DIRTY_PAGES,
+    KVM_PIT_SPEAKER_DUMMY,
 };
+use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
 use kvm_ioctls::{Kvm, VmFd};
 
 use crate::boot;
 use crate::memory;
+#[cfg(target_arch = "aarch64")]
+use crate::boot::arm64;
 use std::os::unix::io::AsRawFd;
 
 use crate::virtio::balloon::VirtioBalloon;
@@ -124,26 +128,72 @@ impl Vm {
 
         // 1. Set up guest memory with overcommit (MAP_NORESERVE)
         let mem_size = (self.config.mem_mb as u64) << 20;
-        let guard_size: u64 = 128 << 20; // 128MB guard past e820 end
-        let mmio_hole_start: u64 = 0xC000_0000; // 3 GB — MMIO hole starts here
-        let mmio_hole_end: u64 = 0x1_0000_0000; // 4 GB — MMIO hole ends here
 
-        let alloc_size = if mem_size <= mmio_hole_start {
-            mem_size + guard_size
-        } else {
-            mmio_hole_start + (mem_size - mmio_hole_start) + guard_size
+        // aarch64 (kvmhost layout): one contiguous slot at GPA 0x40000000 —
+        // the arm64 kernel Image is loaded at RAM_BASE+0x80000 and the DTB
+        // advertises memory@40000000, so nothing may live below RAM_BASE.
+        #[cfg(target_arch = "aarch64")]
+        let (alloc_size, guest_memory) = {
+            let gm = memory::create_guest_memory(mem_size)
+                .context("Failed to create guest memory")?;
+            let mut gm = gm;
+            gm.set_base(crate::boot::arm64::RAM_BASE);
+            (mem_size, gm)
         };
 
-        let guest_memory = if mem_size <= mmio_hole_start {
-            memory::create_guest_memory(alloc_size)
-                .context("Failed to create guest memory")?
-        } else {
-            memory::create_guest_memory_with_hole(alloc_size, mmio_hole_start, mmio_hole_end)
-                .context("Failed to create guest memory")?
+        // x86_64: GPA 0 layout with the 3-4GB MMIO hole for VMs > 3GB.
+        #[cfg(target_arch = "x86_64")]
+        let (alloc_size, guest_memory) = {
+            let guard_size: u64 = 128 << 20; // 128MB guard past e820 end
+            let mmio_hole_start: u64 = 0xC000_0000; // 3 GB — MMIO hole starts here
+            let mmio_hole_end: u64 = 0x1_0000_0000; // 4 GB — MMIO hole ends here
+
+            let alloc_size = if mem_size <= mmio_hole_start {
+                mem_size + guard_size
+            } else {
+                mmio_hole_start + (mem_size - mmio_hole_start) + guard_size
+            };
+
+            let gm = if mem_size <= mmio_hole_start {
+                memory::create_guest_memory(alloc_size)
+                    .context("Failed to create guest memory")?
+            } else {
+                memory::create_guest_memory_with_hole(alloc_size, mmio_hole_start, mmio_hole_end)
+                    .context("Failed to create guest memory")?
+            };
+            (alloc_size, gm)
         };
 
         // 2. Register memory region(s) with KVM
-        if !guest_memory.has_hole() {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mem_region = kvm_userspace_memory_region {
+                slot: 0,
+                guest_phys_addr: crate::boot::arm64::RAM_BASE,
+                memory_size: mem_size,
+                userspace_addr: guest_memory.as_ptr() as u64,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            unsafe {
+                self.vm_fd
+                    .set_user_memory_region(mem_region)
+                    .context("Failed to set KVM memory region (arm64 @0x40000000)")?;
+            }
+            self.kvm_slot_size = mem_size;
+            tracing::info!(
+                "arm64 memory: slot @0x40000000, {}MB, slab at {:#x}",
+                mem_size >> 20,
+                guest_memory.as_ptr() as u64
+            );
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let guard_size: u64 = 128 << 20;
+            let mmio_hole_start: u64 = 0xC000_0000;
+            let mmio_hole_end: u64 = 0x1_0000_0000;
+
+            if !guest_memory.has_hole() {
             // Small VM: single KVM slot
             let mem_region = kvm_userspace_memory_region {
                 slot: 0,
@@ -157,7 +207,8 @@ impl Vm {
                     .set_user_memory_region(mem_region)
                     .context("Failed to set KVM memory region")?;
             }
-        } else {
+            self.kvm_slot_size = alloc_size;
+            } else {
             // Large VM: two KVM slots around the MMIO hole
             let above_hole = mem_size - mmio_hole_start;
 
@@ -195,34 +246,43 @@ impl Vm {
                 mmio_hole_end, above_hole >> 20,
                 mem_size >> 20,
             );
+            }
         }
 
         let t_memory = boot_start.elapsed();
 
-        // 3. Create in-kernel irqchip (LAPIC + IOAPIC) -- must happen before vCPU creation
-        self.vm_fd
-            .create_irq_chip()
-            .context("Failed to create in-kernel irqchip (LAPIC + IOAPIC)")?;
+        // 3. Create in-kernel irqchip + PIT + GSI routing — x86 only.
+        //    On aarch64 the vGICv3 device is created after the vCPUs
+        //    (kvm_arch_vcpu_precreate() refuses once vGIC is up).
+        #[cfg(target_arch = "x86_64")]
+        {
+            // 3. Create in-kernel irqchip (LAPIC + IOAPIC) -- must happen before vCPU creation
+            self.vm_fd
+                .create_irq_chip()
+                .context("Failed to create in-kernel irqchip (LAPIC + IOAPIC)")?;
 
-        // 4. Create in-kernel PIT (i8254 timer) -- must happen before vCPU creation
-        //    KVM_PIT_SPEAKER_DUMMY: handle port 0x61 in-kernel so the kernel's
-        //    PIT verification loop (which reads port 0x61 bit 5) works correctly.
-        let pit_config = kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        };
-        self.vm_fd
-            .create_pit2(pit_config)
-            .context("Failed to create in-kernel PIT (i8254)")?;
+            // 4. Create in-kernel PIT (i8254 timer) -- must happen before vCPU creation
+            //    KVM_PIT_SPEAKER_DUMMY: handle port 0x61 in-kernel so the kernel's
+            //    PIT verification loop (which reads port 0x61 bit 5) works correctly.
+            let pit_config = kvm_pit_config {
+                flags: KVM_PIT_SPEAKER_DUMMY,
+                ..Default::default()
+            };
+            self.vm_fd
+                .create_pit2(pit_config)
+                .context("Failed to create in-kernel PIT (i8254)")?;
 
-        // 5. Set up explicit GSI routing (PIT/PIC/IOAPIC)
-        setup_gsi_routing(&self.vm_fd)?;
+            // 5. Set up explicit GSI routing (PIT/PIC/IOAPIC)
+            setup_gsi_routing(&self.vm_fd)?;
+        }
 
         let t_irqchip = boot_start.elapsed();
-        tracing::info!("In-kernel irqchip (LAPIC + IOAPIC) and PIT created");
+        tracing::info!("arch init: irqchip stage complete");
 
         // 5. Register virtio devices with the MMIO bus
         let mut virtio_cmdline_params = Vec::new();
+        // (base, irq) table for the arm64 DTB virtio-mmio nodes
+        let mut mmio_devices: Vec<(u64, u32)> = Vec::new();
 
         {
             let mut mmio_bus = self.mmio_bus.lock().unwrap();
@@ -234,6 +294,7 @@ impl Vm {
             self.mem_size = mem_size;
             self.kvm_slot_size = alloc_size;
             let (base, irq) = mmio_bus.register(Box::new(balloon));
+            mmio_devices.push((base, irq));
             self.balloon_irq = Some(irq);
             virtio_cmdline_params.push(format!(
                 "virtio_mmio.device=0x{:x}@0x{:x}:{}",
@@ -249,6 +310,7 @@ impl Vm {
                     self.vsock_dev_index = Some(dev_idx);
                     self.vsock_irq = Some(predicted_irq);
                     let (base, irq) = mmio_bus.register(Box::new(vsock));
+                    mmio_devices.push((base, irq));
                     debug_assert_eq!(irq, predicted_irq);
                     virtio_cmdline_params.push(format!(
                         "virtio_mmio.device=0x{:x}@0x{:x}:{}",
@@ -265,6 +327,7 @@ impl Vm {
                 match crate::virtio::block::VirtioBlock::open(block_path, false) {
                     Ok(block) => {
                         let (base, irq) = mmio_bus.register(Box::new(block));
+                        mmio_devices.push((base, irq));
                         virtio_cmdline_params.push(format!(
                             "virtio_mmio.device=0x{:x}@0x{:x}:{}",
                             MMIO_STRIDE, base, irq
@@ -281,6 +344,7 @@ impl Vm {
                 match crate::virtio::block::VirtioBlock::open(overlay_path, false) {
                     Ok(block) => {
                         let (base, irq) = mmio_bus.register(Box::new(block));
+                        mmio_devices.push((base, irq));
                         virtio_cmdline_params.push(format!(
                             "virtio_mmio.device=0x{:x}@0x{:x}:{}",
                             MMIO_STRIDE, base, irq
@@ -308,6 +372,7 @@ impl Vm {
                 if root_dir.is_dir() {
                     let fs_dev = crate::virtio::fs::VirtioFs::new(root_dir, tag.clone());
                     let (base, irq) = mmio_bus.register(Box::new(fs_dev));
+                    mmio_devices.push((base, irq));
                     virtio_cmdline_params.push(format!(
                         "virtio_mmio.device=0x{:x}@0x{:x}:{}",
                         MMIO_STRIDE, base, irq
@@ -338,6 +403,7 @@ impl Vm {
                         let call_fds = net_dev.call_fds();
                         let dev_index = mmio_bus.device_count();
                         let (base, actual_irq) = mmio_bus.register(Box::new(net_dev));
+                        mmio_devices.push((base, actual_irq));
                         debug_assert_eq!(irq, actual_irq);
                         virtio_cmdline_params.push(format!(
                             "virtio_mmio.device=0x{:x}@0x{:x}:{}",
@@ -356,6 +422,10 @@ impl Vm {
         {
             let mut mmio_bus = self.mmio_bus.lock().unwrap();
             mmio_bus.set_guest_memory_with_hole(guest_memory.as_ptr(), guest_memory.size(), guest_memory.hole_start(), guest_memory.hole_end());
+            // arm64: guest RAM starts at GPA RAM_BASE (0x40000000), so all
+            // GPA→HVA translations must subtract the region base. No-op on
+            // x86 where base() is 0.
+            mmio_bus.set_mem_base(guest_memory.base());
         }
 
         // Build the final kernel command line with virtio_mmio.device parameters
@@ -407,7 +477,7 @@ impl Vm {
         tracing::info!("Kernel command line: {cmdline}");
 
         // 6. Load kernel into guest memory
-        let kernel_entry = boot::load_kernel_with_pci(
+        let kernel_entry = boot::load_kernel_for_arch(
             &guest_memory,
             &self.config.kernel_path,
             self.config.initrd_path.as_deref(),
@@ -415,6 +485,7 @@ impl Vm {
             self.config.vcpus,
             mem_size,
             pci_enabled,
+            &mmio_devices,
         )
         .context("Failed to load kernel")?;
 
@@ -435,6 +506,86 @@ impl Vm {
                 vcpu.set_pci_bus(Arc::clone(pci_bus));
             }
             self.vcpus.push(vcpu);
+        }
+
+        // 7b. aarch64: create + place + explicitly init the vGICv3 device.
+        // Order per kvmhost.c (proven on the 5.10 vendor kernel):
+        // vCPU FIRST (kvm_arch_vcpu_precreate refuses once vGIC is up),
+        // then device, DIST addr, REDIST addr, CTRL_INIT.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut cd = arm64::KvmCreateDevice {
+                dev_type: arm64::KVM_DEV_TYPE_ARM_VGIC_V3,
+                fd: 0,
+                flags: 0,
+            };
+            let ret = unsafe {
+                crate::sys::ioctl(
+                    self.vm_fd.as_raw_fd(),
+                    arm64::KVM_CREATE_DEVICE,
+                    &mut cd as *mut _ as *mut libc::c_void,
+                )
+            };
+            if ret < 0 {
+                return Err(anyhow::anyhow!(
+                    "KVM_CREATE_DEVICE(ARM_VGIC_V3) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let vgic_fd = cd.fd;
+            crate::vmm::dbg_store_vgic_fd(vgic_fd);
+
+            let set_attr = |group: u32, attr: u64, val: u64| -> Result<()> {
+                let mut attr_data = val;
+                let a = arm64::KvmDeviceAttr {
+                    flags: 0,
+                    group,
+                    attr,
+                    addr: &mut attr_data as *mut u64 as u64,
+                };
+                let ret = unsafe {
+                    crate::sys::ioctl(
+                        vgic_fd,
+                        arm64::KVM_SET_DEVICE_ATTR,
+                        &a as *const _ as *mut libc::c_void,
+                    )
+                };
+                if ret < 0 {
+                    Err(anyhow::anyhow!(
+                        "vGIC attr group={group} attr={attr} failed: {}",
+                        std::io::Error::last_os_error()
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            set_attr(
+                arm64::KVM_DEV_ARM_VGIC_GRP_ADDR,
+                arm64::KVM_VGIC_V3_ADDR_TYPE_DIST,
+                arm64::GIC_DIST_BASE,
+            )
+            .context("vgic-v3 DIST addr")?;
+            set_attr(
+                arm64::KVM_DEV_ARM_VGIC_GRP_ADDR,
+                arm64::KVM_VGIC_V3_ADDR_TYPE_REDIST,
+                arm64::GIC_REDIST_BASE,
+            )
+            .context("vgic-v3 REDIST addr")?;
+            set_attr(
+                arm64::KVM_DEV_ARM_VGIC_GRP_CTRL,
+                arm64::KVM_DEV_ARM_VGIC_CTRL_INIT,
+                0,
+            )
+            .context("vgic-v3 CTRL_INIT")?;
+            // vgic fd intentionally leaked for the VM's lifetime (KVM owns state;
+            // closing early can tear the interrupt controller down).
+            tracing::info!(
+                "vGICv3 created: dist@{:#x} redist@{:#x} ({} vcpus)",
+                arm64::GIC_DIST_BASE,
+                arm64::GIC_REDIST_BASE,
+                self.config.vcpus
+            );
         }
 
         self.guest_memory = Some(guest_memory);
@@ -532,22 +683,26 @@ impl Vm {
         }
 
         // 3. Create in-kernel irqchip and PIT (required before restore)
-        self.vm_fd
-            .create_irq_chip()
-            .context("Failed to create in-kernel irqchip")?;
-        let pit_config = kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        };
-        self.vm_fd
-            .create_pit2(pit_config)
-            .context("Failed to create in-kernel PIT")?;
-        setup_gsi_routing(&self.vm_fd)?;
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.vm_fd
+                .create_irq_chip()
+                .context("Failed to create in-kernel irqchip")?;
+            let pit_config = kvm_pit_config {
+                flags: KVM_PIT_SPEAKER_DUMMY,
+                ..Default::default()
+            };
+            self.vm_fd
+                .create_pit2(pit_config)
+                .context("Failed to create in-kernel PIT")?;
+            setup_gsi_routing(&self.vm_fd)?;
+        }
 
         // 3b. Restore VM state: PIT → clock → PICs → IOAPIC
         // (matches Firecracker's restore_state order exactly)
 
         // Restore PIT state from snapshot
+        #[cfg(target_arch = "x86_64")]
         if !template.device_states.pit.is_empty() {
             let expected = std::mem::size_of::<kvm_bindings::kvm_pit_state2>();
             if template.device_states.pit.len() == expected {
@@ -568,6 +723,7 @@ impl Vm {
         }
 
         // Restore irqchip (PIC master, PIC slave, IOAPIC) from snapshot
+        #[cfg(target_arch = "x86_64")]
         if template.device_states.irqchip.len() == 3 {
             use kvm_bindings::kvm_irqchip;
             let expected_size = std::mem::size_of::<kvm_irqchip>();
@@ -683,12 +839,12 @@ impl Vm {
                                 flags: 1, ..Default::default()
                             };
                             let ret = unsafe {
-                                libc::ioctl(self.vm_fd.as_raw_fd(), 0x4040AE79u64 as libc::c_ulong, &ioeventfd)
+                                crate::sys::ioctl(self.vm_fd.as_raw_fd(), 0x4040AE79u64 as u64, &ioeventfd as *const _ as *mut libc::c_void)
                             };
                             if ret != 0 {
                                 ioeventfd.flags = 0;
                                 ioeventfd.datamatch = 0;
-                                unsafe { libc::ioctl(self.vm_fd.as_raw_fd(), 0x4040AE79u64 as libc::c_ulong, &ioeventfd); }
+                                unsafe { crate::sys::ioctl(self.vm_fd.as_raw_fd(), 0x4040AE79u64 as u64, &ioeventfd as *const _ as *mut libc::c_void); }
                             }
                         }
                         self.net_tap_info = Some((tap_fd, dev_index, actual_irq, kick_evt));
@@ -703,6 +859,7 @@ impl Vm {
             // (virtio-fs registered above, before net)
 
             mmio_bus.set_guest_memory_with_hole(guest_memory.as_ptr(), guest_memory.size(), guest_memory.hole_start(), guest_memory.hole_end());
+            mmio_bus.set_mem_base(guest_memory.base());
 
             // Restore transport state from the template snapshot so devices are
             // in the same state the guest kernel expects (queue addresses, activated).
@@ -777,6 +934,7 @@ impl Vm {
                 Arc::clone(&self.serial),
             )?;
             // Notify guest this vCPU was paused (prevents soft lockup watchdog)
+            #[cfg(target_arch = "x86_64")]
             let _ = vcpu.fd().kvmclock_ctrl();
             self.vcpus.push(vcpu);
         }
@@ -791,8 +949,8 @@ impl Vm {
                 transport.vhost_interrupt().fetch_or(1, std::sync::atomic::Ordering::Release);
             }
             drop(bus);
-            let _ = self.vm_fd.set_irq_line(irq, true);
-            let _ = self.vm_fd.set_irq_line(irq, false);
+            let _ = set_spi_line(&self.vm_fd, irq, true);
+            let _ = set_spi_line(&self.vm_fd, irq, false);
         }
 
         tracing::info!(
@@ -836,8 +994,8 @@ impl Vm {
                 // Raise IRQ 4 if the guest enabled data-available interrupts (IER bit 0)
                 if serial.interrupt_enabled() {
                     drop(serial); // release lock before ioctl
-                    let _ = vm_fd_clone.set_irq_line(4, true);
-                    let _ = vm_fd_clone.set_irq_line(4, false);
+                    let _ = set_spi_line(&vm_fd_clone, 4, true);
+                    let _ = set_spi_line(&vm_fd_clone, 4, false);
                 }
             }
         });
@@ -893,8 +1051,8 @@ impl Vm {
                             }
                         }
                         // Inject IRQ (edge-triggered)
-                        let _ = vm_fd_clone.set_irq_line(irq, true);
-                        let _ = vm_fd_clone.set_irq_line(irq, false);
+                        let _ = set_spi_line(&vm_fd_clone, irq, true);
+                        let _ = set_spi_line(&vm_fd_clone, irq, false);
                     }
                 }
             });
@@ -909,8 +1067,8 @@ impl Vm {
                 let signal = Arc::new(crate::virtio::vsock::IrqSignal {
                     interrupt_status,
                     signal_fn: Box::new(move || {
-                        let _ = vm_fd.set_irq_line(irq, true);
-                        let _ = vm_fd.set_irq_line(irq, false);
+                        let _ = set_spi_line(&vm_fd, irq, true);
+                        let _ = set_spi_line(&vm_fd, irq, false);
                     }),
                 });
                 if let Some(vsock) = transport.device_mut().as_any_mut().downcast_mut::<VirtioVsock>() {
@@ -946,8 +1104,8 @@ impl Vm {
                                         // Signal guest interrupt
                                         vhost_int.fetch_or(1, std::sync::atomic::Ordering::Release);
                                         drop(bus);
-                                        let _ = vm_fd_clone.set_irq_line(irq, true);
-                                        let _ = vm_fd_clone.set_irq_line(irq, false);
+                                        let _ = set_spi_line(&vm_fd_clone, irq, true);
+                                        let _ = set_spi_line(&vm_fd_clone, irq, false);
                                     }
                                 }
                             }
@@ -1015,8 +1173,8 @@ impl Vm {
                             }
                         }
                         if need_irq {
-                            let _ = vm_fd_clone.set_irq_line(irq, true);
-                            let _ = vm_fd_clone.set_irq_line(irq, false);
+                            let _ = set_spi_line(&vm_fd_clone, irq, true);
+                            let _ = set_spi_line(&vm_fd_clone, irq, false);
                         }
                     }
                 })
@@ -1094,8 +1252,8 @@ impl Vm {
                                     transport.raise_config_change_interrupt();
                                 }
                             }
-                            let _ = vm_fd_clone.set_irq_line(balloon_irq, true);
-                            let _ = vm_fd_clone.set_irq_line(balloon_irq, false);
+                            let _ = set_spi_line(&vm_fd_clone, balloon_irq, true);
+                            let _ = set_spi_line(&vm_fd_clone, balloon_irq, false);
                         }
 
                         // Periodically refresh overcommit tracking (every 10 ticks = 10s)
@@ -1118,7 +1276,7 @@ impl Vm {
 
         // Run all vCPUs — BSP on main thread, APs on spawned threads.
         let mut ap_handles = Vec::new();
-        let mut vcpu_threads: Vec<libc::pthread_t> = Vec::new();
+        let mut vcpu_threads: Vec<usize> = Vec::new();
 
         // Drain vCPUs: take APs first (index 1+), then BSP (index 0) runs on main thread.
         let mut all_vcpus: Vec<vcpu::Vcpu> = self.vcpus.drain(..).collect();
@@ -1126,12 +1284,12 @@ impl Vm {
         // Spawn AP threads (vCPU 1, 2, ...) and capture their pthread_t handles
         for vcpu in all_vcpus.drain(1..) {
             // Use a channel to get the pthread_t from inside the spawned thread
-            let (tx, rx) = std::sync::mpsc::channel::<libc::pthread_t>();
+            let (tx, rx) = std::sync::mpsc::channel::<usize>();
             let handle = std::thread::Builder::new()
                 .name(format!("vcpu-{}", vcpu.id()))
                 .spawn(move || {
                     // Send our pthread_t to the main thread
-                    let _ = tx.send(unsafe { libc::pthread_self() });
+                    let _ = tx.send(unsafe { libc::pthread_self() } as usize);
                     let mut vcpu = vcpu;
                     if let Err(e) = vcpu.run_loop() {
                         tracing::error!("vCPU {} exited with error: {e}", vcpu.id());
@@ -1146,7 +1304,7 @@ impl Vm {
         }
 
         // BSP (vCPU 0) runs on the main thread — store its pthread_t
-        let bsp_tid = unsafe { libc::pthread_self() };
+        let bsp_tid = unsafe { libc::pthread_self() } as usize;
         // Insert BSP at front so vcpu_threads[0] = BSP
         vcpu_threads.insert(0, bsp_tid);
 
@@ -1264,8 +1422,8 @@ impl Vm {
                                                 serial.enqueue_input(buf[i]);
                                                 if serial.interrupt_enabled() {
                                                     drop(serial);
-                                                    let _ = vm_fd_for_console.set_irq_line(4, true);
-                                                    let _ = vm_fd_for_console.set_irq_line(4, false);
+                                                    let _ = set_spi_line(&vm_fd_for_console, 4, true);
+                                                    let _ = set_spi_line(&vm_fd_for_console, 4, false);
                                                 }
                                             }
                                         }
@@ -1320,6 +1478,7 @@ impl Vm {
 /// This matches what KVM sets up by default with create_irq_chip(), but
 /// being explicit ensures nothing is missed. GSI 0-7 go to both PIC master
 /// and IOAPIC, GSI 8-15 to PIC slave and IOAPIC, GSI 16-23 to IOAPIC only.
+#[cfg(target_arch = "x86_64")]
 pub fn setup_gsi_routing(vm_fd: &VmFd) -> Result<()> {
     // Build routing entries: 24 IOAPIC + 8 PIC master + 8 PIC slave = 40 entries
     let mut entries: Vec<kvm_irq_routing_entry> = Vec::with_capacity(40);
@@ -1373,3 +1532,83 @@ pub fn setup_gsi_routing(vm_fd: &VmFd) -> Result<()> {
     tracing::info!("GSI routing configured: 24 IOAPIC + 16 PIC entries");
     Ok(())
 }
+
+/// Inject a device IRQ line. x86: raw IRQ line. aarch64: KVM_IRQ_LINE
+/// takes a composite word `type<<24 | vcpu<<16 | num` — SPI injection is
+/// `KVM_ARM_IRQ_TYPE_SPI=1` and the number is the GIC **INTID** (SPI
+/// number + 32), like kvmtool's `spi_irq + 32` and QEMU's
+/// `irq + GIC_INTERNAL`. Passing the bare SPI number fails the kernel's
+/// `irqid < 32` check with -EINVAL (verified on-device via strace:
+/// ioctl(4, KVM_IRQ_LINE, ...) = -1 EINVAL — the block-device kick was
+/// reaching clone but the injection was rejected, so virtio I/O hung).
+/// Lines are edge-pulsed by the callers.
+#[allow(unused_variables)]
+fn set_spi_line(vm_fd: &VmFd, irq: u32, active: bool) {
+    #[cfg(target_arch = "aarch64")]
+    let irq = (1u32 << 24) | ((irq + 32) & 0xFFFF);
+    let ret = vm_fd.set_irq_line(irq, active);
+    if let Err(e) = ret {
+        tracing::warn!("set_irq_line({irq:#x}, {active}) failed: {e}");
+    }
+    let _ = ret;
+}
+
+// TEMP DEBUG: vgic fd stashed for post-injection state dumps.
+static VGIC_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+pub fn dbg_store_vgic_fd(fd: i32) {
+    VGIC_FD.store(fd, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn dbg_vgic_read_reg(group: u32, attr: u64) -> u32 {
+    let vgic_fd = VGIC_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if vgic_fd < 0 {
+        return 0xDEADBEEF;
+    }
+    let mut val: u32 = 0;
+    let a = crate::boot::arm64::KvmDeviceAttr {
+        flags: 0,
+        group,
+        attr,
+        addr: &mut val as *mut u32 as u64,
+    };
+    let ret = unsafe {
+        crate::sys::ioctl(
+            vgic_fd,
+            crate::boot::arm64::KVM_GET_DEVICE_ATTR,
+            &a as *const _ as *mut libc::c_void,
+        )
+    };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!("vgic GET_DEVICE_ATTR group={group} attr={attr:#x} failed: {err}");
+        return 0xFFFF_FFFF;
+    }
+    val
+}
+
+/// TEMP DEBUG: after injecting an SPI, dump the vGIC state that determines
+/// whether the guest can possibly take it (CTLR, ISENABLER, ISPENDR for the
+/// intid, and IROUTER). Called from the run loop for virtio kicks.
+#[cfg(target_arch = "aarch64")]
+pub fn dbg_vgic_dump_spi(intid: u32) {
+    if VGIC_FD.load(std::sync::atomic::Ordering::SeqCst) < 0 {
+        return;
+    }
+    let ena_off = 0x100u64 + ((intid / 32) * 4) as u64;
+    let pend_off = 0x200u64 + ((intid / 32) * 4) as u64;
+    let irouter_off = 0x6000u64 + ((intid - 32) * 8) as u64;
+    let ctlr = dbg_vgic_read_reg(1, 0x0);
+    let isena = dbg_vgic_read_reg(1, ena_off);
+    let ispend = dbg_vgic_read_reg(1, pend_off);
+    let irouter = dbg_vgic_read_reg(1, irouter_off);
+    let bit = intid % 32;
+    tracing::info!(
+        "vgic-dump intid={intid}: CTLR={ctlr:#x} ISENABLER[{ena_off:#x}]={isena:#x} (bit{bit}={}) ISPENDR[{pend_off:#x}]={ispend:#x} (bit{bit}={}) IROUTER[{irouter_off:#x}]={irouter:#x}",
+        isena & (1 << bit) != 0,
+        ispend & (1 << bit) != 0,
+    );
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn dbg_vgic_dump_spi(_intid: u32) {}

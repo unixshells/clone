@@ -111,12 +111,22 @@ pub fn find_agent_binary() -> Option<PathBuf> {
 /// Searches `/lib/modules/<running-kernel>/` for vsock and overlay modules.
 /// These are placed at `/lib/modules/` (flat) in the initrd so clone-init
 /// can load them before switching root into the real rootfs.
-fn embed_kernel_modules(cpio: &mut Vec<u8>) {
-    let uname = match std::process::Command::new("uname").arg("-r").output() {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
-        _ => return,
+fn embed_kernel_modules(cpio: &mut Vec<u8>, kernel_version: Option<&str>) {
+    // Module tree must match the GUEST kernel, not the host running the
+    // VMM (on a phone Dom0, uname -r is the Android host kernel while the
+    // guest boots vmlinuz-<guest-version>). Prefer the version parsed
+    // from the --kernel filename; fall back to uname.
+    let uname = kernel_version.map(str::to_string).or_else(|| {
+        std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    });
+    let uname = match uname {
+        Some(u) => u,
+        None => return,
     };
 
     let mod_root = PathBuf::from(format!("/lib/modules/{uname}"));
@@ -125,8 +135,21 @@ fn embed_kernel_modules(cpio: &mut Vec<u8>) {
         return;
     }
 
-    // Modules to embed: (subdir, filename) — loaded in order by clone-init
+    // Modules to embed: (subdir, filename) — loaded in dependency order by
+    // clone-init BEFORE waiting for /dev/vda. On Debian arm64 kernels,
+    // ext4/virtio_mmio/virtio_blk are modules (CONFIG_*_m) and the core
+    // virtio layer is built-in, so this exact chain makes the root
+    // mountable.
     let modules: &[(&str, &str)] = &[
+        // ext4 dependency chain (crc32c -> crc16 -> jbd2 -> mbcache -> ext4)
+        ("kernel/crypto", "crc32c-cryptoapi.ko"),
+        ("kernel/lib/crc", "crc16.ko"),
+        ("kernel/fs/jbd2", "jbd2.ko"),
+        ("kernel/fs", "mbcache.ko"),
+        ("kernel/fs/ext4", "ext4.ko"),
+        // virtio transport + block (core virtio is built-in)
+        ("kernel/drivers/virtio", "virtio_mmio.ko"),
+        ("kernel/drivers/block", "virtio_blk.ko"),
         // vsock transport (needed for guest agent)
         ("kernel/net/vmw_vsock", "vsock.ko"),
         ("kernel/net/vmw_vsock", "vmw_vsock_virtio_transport_common.ko"),
@@ -180,7 +203,7 @@ fn embed_kernel_modules(cpio: &mut Vec<u8>) {
 /// and optionally the clone-agent binary.
 ///
 /// Returns the initrd contents as a byte vector.
-pub fn generate_initrd(init_binary: &Path) -> Result<Vec<u8>> {
+pub fn generate_initrd(init_binary: &Path, kernel_version: Option<&str>) -> Result<Vec<u8>> {
     let init_data =
         fs::read(init_binary).with_context(|| format!("Failed to read {}", init_binary.display()))?;
 
@@ -229,7 +252,7 @@ pub fn generate_initrd(init_binary: &Path) -> Result<Vec<u8>> {
     // Include vsock kernel modules so clone-init can load them before switching root.
     // These are required for the guest agent to connect back to the host VMM.
     // The kernel may have CONFIG_VIRTIO_VSOCKETS=m, so modules must be loaded explicitly.
-    embed_kernel_modules(&mut cpio);
+    embed_kernel_modules(&mut cpio, kernel_version);
 
     // Write trailer
     cpio_write_trailer(&mut cpio);

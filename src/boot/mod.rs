@@ -17,6 +17,10 @@ const BOOT_PARAMS_ADDR: u64 = 0x7000;
 /// Kernel command line placed at 0x20000.
 const CMDLINE_ADDR: u64 = 0x2_0000;
 
+/// arm64 guest boot (Image loader + hand-built FDT, ported from dom0/kvmhost.c).
+#[cfg(target_arch = "aarch64")]
+pub mod arm64;
+
 /// Load a Linux kernel (bzImage or ELF) into guest memory.
 /// Returns the entry point address.
 pub fn load_kernel(
@@ -79,6 +83,40 @@ pub fn load_kernel_with_pci(
     }
 
     Ok(entry)
+}
+
+/// Arch dispatch: aarch64 boots an Image + hand-built DTB (kvmhost path);
+/// x86_64 keeps the bzImage/boot_params loader. `mmio_devices` is the
+/// registered virtio-mmio (base, irq) table — used for DTB nodes on arm64.
+/// `ram_size` = total guest RAM bytes; on aarch64 it is the span of the
+/// single KVM slot registered at GPA 0x40000000 (see Vm::boot).
+pub fn load_kernel_for_arch(
+    mem: &GuestMem,
+    kernel_path: &str,
+    initrd_path: Option<&str>,
+    cmdline: &str,
+    num_cpus: u32,
+    ram_size: u64,
+    pci_enabled: bool,
+    mmio_devices: &[(u64, u32)],
+) -> Result<GuestAddress> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return arm64::load_image_boot(
+            mem,
+            kernel_path,
+            initrd_path,
+            cmdline,
+            num_cpus,
+            ram_size,
+            mmio_devices,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = mmio_devices;
+        load_kernel_with_pci(mem, kernel_path, initrd_path, cmdline, num_cpus, ram_size, pci_enabled)
+    }
 }
 
 /// Check if kernel is a bzImage (Linux boot protocol magic).

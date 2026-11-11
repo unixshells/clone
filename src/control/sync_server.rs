@@ -28,8 +28,10 @@ pub struct VmHandle {
     pub kvm_slot_size: u64,
     /// Shared vCPU pause coordination state.
     pub pause_state: Arc<VcpuPauseState>,
-    /// pthread_t handles for each vCPU thread (used for SIGUSR1 kick).
-    pub vcpu_threads: Vec<libc::pthread_t>,
+    /// vCPU thread IDs (pthread_t as usize — musl types pthread_t as a raw
+    /// pointer, which isn't Send; usize travels across threads fine and is
+    /// cast back to pthread_t at every libc call site).
+    pub vcpu_threads: Vec<usize>,
     /// Number of vCPUs.
     pub num_vcpus: u32,
     /// Global shutdown flag (shared with the VM run loop).
@@ -234,11 +236,11 @@ fn pause_vcpus(vm: &VmHandle) -> Result<(), String> {
 
     // Kick each vCPU out of KVM_RUN (send twice to handle races)
     for &tid in &vm.vcpu_threads {
-        unsafe { libc::pthread_kill(tid, libc::SIGUSR1); }
+        unsafe { libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1); }
     }
     std::thread::sleep(std::time::Duration::from_millis(50));
     for &tid in &vm.vcpu_threads {
-        unsafe { libc::pthread_kill(tid, libc::SIGUSR1); }
+        unsafe { libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1); }
     }
 
     // Wait for all vCPUs to park
@@ -335,7 +337,7 @@ fn handle_shutdown(vm: &VmHandle) -> Response {
     // Kick vCPUs out of KVM_RUN so they notice the shutdown
     for &tid in &vm.vcpu_threads {
         unsafe {
-            libc::pthread_kill(tid, libc::SIGUSR1);
+            libc::pthread_kill(tid as libc::pthread_t, libc::SIGUSR1);
         }
     }
 
@@ -474,8 +476,11 @@ fn handle_snapshot(vm: &VmHandle, output_path: &str) -> Response {
             .collect();
 
         // Save in-kernel irqchip state (PIC master, PIC slave, IOAPIC) and PIT
-        let mut irqchip_states = Vec::new();
-        let mut pit_bytes = Vec::new();
+        // x86-only: aarch64 has no PIC/IOAPIC/PIT to save (vGIC state lives
+        // in-kernel and is regenerated on the fresh-boot path).
+        #[cfg(target_arch = "x86_64")]
+        let (mut irqchip_states, mut pit_bytes) = (Vec::new(), Vec::new());
+        #[cfg(target_arch = "x86_64")]
         if let Some(ref vm_fd) = vm.vm_fd {
             use kvm_bindings::{KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_IRQCHIP_IOAPIC, kvm_irqchip};
             for chip_id in [KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_IRQCHIP_IOAPIC] {
@@ -507,6 +512,9 @@ fn handle_snapshot(vm: &VmHandle, output_path: &str) -> Response {
             }
         }
 
+        #[cfg(not(target_arch = "x86_64"))]
+        let (irqchip_states, pit_bytes): (Vec<Vec<u8>>, Vec<u8>) = (Vec::new(), Vec::new());
+
         DeviceStates {
             serial: None,
             virtio_configs: std::collections::HashMap::new(),
@@ -517,10 +525,14 @@ fn handle_snapshot(vm: &VmHandle, output_path: &str) -> Response {
     };
 
     // 3. Save kvmclock and template
+    // x86-only (KVM_GET_CLOCK is an x86 ioctl); arm64 guests use the arch timer.
+    #[cfg(target_arch = "x86_64")]
     let clock_ns = vm.vm_fd.as_ref()
         .and_then(|fd| fd.get_clock().ok())
         .map(|c| c.clock)
         .unwrap_or(0);
+    #[cfg(not(target_arch = "x86_64"))]
+    let clock_ns: u64 = 0;
 
     let result = {
         let guest_mem = unsafe {

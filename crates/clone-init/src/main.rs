@@ -110,6 +110,22 @@ fn main() {
     if Path::new("/lib/modules/overlay.ko").exists() {
         load_module("/lib/modules/overlay.ko");
     }
+    // Boot-critical modules for kernels where ext4/virtio are =m (Debian
+    // arm64). Dependency order matters: crc32c -> crc16 -> jbd2 -> mbcache
+    // -> ext4; virtio_mmio/virtio_blk have no deps (core virtio built-in).
+    for module in &[
+        "/lib/modules/crc32c-cryptoapi.ko",
+        "/lib/modules/crc16.ko",
+        "/lib/modules/jbd2.ko",
+        "/lib/modules/mbcache.ko",
+        "/lib/modules/ext4.ko",
+        "/lib/modules/virtio_mmio.ko",
+        "/lib/modules/virtio_blk.ko",
+    ] {
+        if Path::new(module).exists() {
+            load_module(module);
+        }
+    }
 
     // Parse kernel command line
     let cmdline = read_cmdline();

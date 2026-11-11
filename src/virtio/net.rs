@@ -140,6 +140,8 @@ pub struct VirtioNet {
     queue_configs: Vec<QueueInfo>,
     guest_mem: *mut u8,
     guest_mem_size: u64,
+    /// GPA of the start of the mapped region (0 on x86, RAM_BASE on arm64).
+    mem_base: u64,
     hole_start: u64,
     hole_end: u64,
 }
@@ -150,6 +152,10 @@ unsafe impl Send for VirtioNet {}
 impl VirtioNet {
     fn gpa_to_hva(&self, gpa: u64) -> u64 {
         let base = self.guest_mem as u64;
+        let gpa = match gpa.checked_sub(self.mem_base) {
+            Some(g) => g,
+            None => return base,
+        };
         if self.hole_start == 0 || gpa < self.hole_start {
             base + gpa
         } else if gpa >= self.hole_end {
@@ -177,6 +183,7 @@ impl VirtioNet {
             queue_configs: Vec::new(),
             guest_mem: std::ptr::null_mut(),
             guest_mem_size: 0,
+            mem_base: 0,
             hole_start: 0,
             hole_end: 0,
         }
@@ -489,6 +496,11 @@ impl VirtioNet {
 
     /// GPA → host pointer, accounting for MMIO hole.
     fn gpa_to_ptr(&self, gpa: u64) -> *mut u8 {
+        // gpa is relative to mem_base (0 on x86, RAM_BASE on arm64).
+        let gpa = match gpa.checked_sub(self.mem_base) {
+            Some(g) => g,
+            None => return std::ptr::null_mut(),
+        };
         let offset = if self.hole_start > 0 && gpa >= self.hole_end {
             self.hole_start + (gpa - self.hole_end)
         } else {
@@ -728,6 +740,10 @@ impl VirtioDevice for VirtioNet {
     fn set_memory_hole(&mut self, hole_start: u64, hole_end: u64) {
         self.hole_start = hole_start;
         self.hole_end = hole_end;
+    }
+
+    fn set_mem_base(&mut self, mem_base: u64) {
+        self.mem_base = mem_base;
     }
 
     fn activate(&mut self) -> anyhow::Result<()> {

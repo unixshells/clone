@@ -122,6 +122,11 @@ pub trait VirtioDevice: Send {
     /// Called before activate() for VMs with >3GB RAM.
     fn set_memory_hole(&mut self, _hole_start: u64, _hole_end: u64) {}
 
+    /// Set the GPA of the start of the mapped guest memory region
+    /// (0 on x86 where guest RAM starts at GPA 0; RAM_BASE on arm64).
+    /// Devices that translate GPAs to host pointers must subtract this.
+    fn set_mem_base(&mut self, _mem_base: u64) {}
+
     /// Reset the device to initial state.
     fn reset(&mut self);
 

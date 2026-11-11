@@ -422,6 +422,10 @@ impl Vm {
         {
             let mut mmio_bus = self.mmio_bus.lock().unwrap();
             mmio_bus.set_guest_memory_with_hole(guest_memory.as_ptr(), guest_memory.size(), guest_memory.hole_start(), guest_memory.hole_end());
+            // arm64: guest RAM starts at GPA RAM_BASE (0x40000000), so all
+            // GPA→HVA translations must subtract the region base. No-op on
+            // x86 where base() is 0.
+            mmio_bus.set_mem_base(guest_memory.base());
         }
 
         // Build the final kernel command line with virtio_mmio.device parameters
@@ -854,6 +858,7 @@ impl Vm {
             // (virtio-fs registered above, before net)
 
             mmio_bus.set_guest_memory_with_hole(guest_memory.as_ptr(), guest_memory.size(), guest_memory.hole_start(), guest_memory.hole_end());
+            mmio_bus.set_mem_base(guest_memory.base());
 
             // Restore transport state from the template snapshot so devices are
             // in the same state the guest kernel expects (queue addresses, activated).

@@ -103,6 +103,8 @@ pub struct VirtioVsock {
     queue_configs: Vec<QueueInfo>,
     guest_mem: *mut u8,
     guest_mem_size: u64,
+    /// GPA of the start of the mapped region (0 on x86, RAM_BASE on arm64).
+    mem_base: u64,
     hole_start: u64,
     hole_end: u64,
 
@@ -234,11 +236,24 @@ impl VirtioVsock {
     // --- GPA translation ---
 
     fn gpa_to_ptr(&self, gpa: u64) -> *mut u8 {
+        // Guest RAM starts at GPA mem_base (0 on x86, RAM_BASE on arm64);
+        // translate to an offset within the mapped region first. Bounds
+        // check so a bogus queue address can't segfault the VMM.
+        let gpa = match gpa.checked_sub(self.mem_base) {
+            Some(g) => g,
+            None => return std::ptr::null_mut(),
+        };
+        if gpa >= self.guest_mem_size {
+            return std::ptr::null_mut();
+        }
         let offset = if self.hole_start > 0 && gpa >= self.hole_end {
             self.hole_start + (gpa - self.hole_end)
         } else {
             gpa
         };
+        if offset >= self.guest_mem_size {
+            return std::ptr::null_mut();
+        }
         unsafe { self.guest_mem.add(offset as usize) }
     }
 
@@ -635,12 +650,17 @@ impl VirtioDevice for VirtioVsock {
         // Initialize queue indices from guest memory.
         for (qi, qc) in queues.iter().enumerate() {
             if qi < NUM_QUEUES && !guest_mem.is_null() && qc.avail_addr != 0 {
-                let avail_idx = unsafe {
-                    *(self.gpa_to_ptr(qc.avail_addr + 2) as *const u16)
-                };
-                let used_idx = unsafe {
-                    *(self.gpa_to_ptr(qc.used_addr + 2) as *const u16)
-                };
+                let avail_ptr = self.gpa_to_ptr(qc.avail_addr + 2) as *const u16;
+                let used_ptr = self.gpa_to_ptr(qc.used_addr + 2) as *const u16;
+                if avail_ptr.is_null() || used_ptr.is_null() {
+                    tracing::warn!(
+                        "virtio-vsock: queue {qi} addresses out of range (avail={:#x} used={:#x}), skipping",
+                        qc.avail_addr, qc.used_addr
+                    );
+                    continue;
+                }
+                let avail_idx = unsafe { *avail_ptr };
+                let used_idx = unsafe { *used_ptr };
                 self.last_used[qi] = used_idx;
                 if qi == TX_QUEUE as usize {
                     // TX: start from avail_idx to skip already-posted buffers.
@@ -656,6 +676,10 @@ impl VirtioDevice for VirtioVsock {
     fn set_memory_hole(&mut self, hole_start: u64, hole_end: u64) {
         self.hole_start = hole_start;
         self.hole_end = hole_end;
+    }
+
+    fn set_mem_base(&mut self, mem_base: u64) {
+        self.mem_base = mem_base;
     }
 
     fn activate(&mut self) -> anyhow::Result<()> {

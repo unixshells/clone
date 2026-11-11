@@ -59,8 +59,11 @@ pub struct Virtqueue {
     used_ring: u64,
     /// Last index we consumed from the available ring.
     last_avail_idx: u16,
-    /// Host pointer to guest physical address 0.
+    /// Host pointer to the start of the mapped guest memory region.
+    /// Corresponds to GPA `mem_base` (0 on x86, RAM_BASE on arm64).
     guest_mem: *mut u8,
+    /// GPA of the start of the mapped region (0 when guest RAM starts at 0).
+    mem_base: u64,
     /// Total size of the guest memory mmap region.
     guest_mem_size: u64,
     /// MMIO hole: GPA range [hole_start, hole_end) has no backing memory.
@@ -83,6 +86,7 @@ impl Virtqueue {
             used_ring: 0,
             last_avail_idx: 0,
             guest_mem,
+            mem_base: 0,
             guest_mem_size,
             hole_start: 0,
             hole_end: 0,
@@ -93,6 +97,11 @@ impl Virtqueue {
     pub fn set_hole(&mut self, hole_start: u64, hole_end: u64) {
         self.hole_start = hole_start;
         self.hole_end = hole_end;
+    }
+
+    /// Set the GPA of the start of the mapped region (arm64: RAM_BASE).
+    pub fn set_mem_base(&mut self, mem_base: u64) {
+        self.mem_base = mem_base;
     }
 
     /// Configure the three ring area addresses.
@@ -140,6 +149,9 @@ impl Virtqueue {
     /// Translate a guest physical address to a userspace offset,
     /// accounting for the MMIO hole on large VMs.
     fn gpa_to_offset(&self, gpa: u64) -> Option<usize> {
+        // Translate within the mapped region: gpa is relative to the
+        // region start (mem_base), 0 on x86 where guest RAM starts at 0.
+        let gpa = gpa.checked_sub(self.mem_base)?;
         if self.hole_start == 0 {
             // No hole — direct mapping
             if gpa >= self.guest_mem_size { return None; }

@@ -8,6 +8,8 @@ use kvm_bindings::{KVM_MAX_CPUID_ENTRIES, Msrs};
 // AsRawFd needed for the aarch64 ONE_REG path
 #[cfg(target_arch = "aarch64")]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_arch = "aarch64")]
+use crate::boot::arm64;
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vm_memory::GuestAddress;
 
@@ -272,7 +274,6 @@ impl Vcpu {
 
         #[cfg(target_arch = "aarch64")]
         {
-            let arm64 = crate::boot::arm64;
             let mut vi = arm64::KvmVcpuInit {
                 target: arm64::KVM_ARM_TARGET_GENERIC_V8,
                 features: [0u32; 32],
@@ -308,7 +309,6 @@ impl Vcpu {
     /// Write one aarch64 core register via KVM_SET_ONE_REG.
     #[cfg(target_arch = "aarch64")]
     fn set_arm64_core_reg(vcpu_fd: libc::c_int, reg_id: u64, value: u64) -> Result<()> {
-        let arm64 = crate::boot::arm64;
         let mut v = value;
         let r = arm64::KvmOneReg {
             id: reg_id,

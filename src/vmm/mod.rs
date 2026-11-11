@@ -18,6 +18,8 @@ use kvm_ioctls::{Kvm, VmFd};
 
 use crate::boot;
 use crate::memory;
+#[cfg(target_arch = "aarch64")]
+use crate::boot::arm64;
 use std::os::unix::io::AsRawFd;
 
 use crate::virtio::balloon::VirtioBalloon;
@@ -460,7 +462,6 @@ impl Vm {
         // then device, DIST addr, REDIST addr, CTRL_INIT.
         #[cfg(target_arch = "aarch64")]
         {
-            let arm64 = crate::boot::arm64;
             let mut cd = arm64::KvmCreateDevice {
                 dev_type: arm64::KVM_DEV_TYPE_ARM_VGIC_V3,
                 fd: 0,

@@ -244,9 +244,13 @@ pub fn build_dtb(
     let mut b = FdtBuilder::new();
 
     let memreg: [u32; 4] = [0, RAM_BASE as u32, 0, ram_span as u32];
+    // Each vCPU owns a 2-page (0x20000) GICR frame (RD + SGI bases). The DT
+    // must declare the full span the kernel will walk — undersizing it
+    // crashes gic_iterate_rdists when num_cpus > 1 (proven: python replica
+    // booted all the way to root-mount panic after 0x40000 with 2 CPUs).
     let gicreg: [u32; 8] = [
         0, GIC_DIST_BASE as u32, 0, 0x10000,
-        0, GIC_REDIST_BASE as u32, 0, 0x20000,
+        0, GIC_REDIST_BASE as u32, 0, (0x20000u64 * num_cpus.max(1) as u64) as u32,
     ];
     let uartreg: [u32; 4] = [0, PL011_BASE as u32, 0, PL011_SIZE as u32];
 

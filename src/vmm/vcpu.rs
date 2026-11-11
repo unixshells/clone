@@ -842,7 +842,18 @@ impl Vcpu {
                         let action = ExitAction::Debug { pc: 0, dr6: 0 };
                         action
                     }
-                    other => ExitAction::Unknown(format!("{:?}", other)),
+                    #[cfg(target_arch = "aarch64")]
+                VcpuExit::SystemEvent(event_type, _data) => {
+                    // Guest called PSCI SYSTEM_OFF/SYS_RESET (e.g. the
+                    // panic handler with panic=-1, or a clean poweroff).
+                    // Not an error — treat as a deliberate guest shutdown.
+                    tracing::info!(
+                        "vCPU {} guest PSCI system event type={}: guest requested stop",
+                        self.id, event_type
+                    );
+                    ExitAction::Shutdown
+                }
+                other => ExitAction::Unknown(format!("{:?}", other)),
                 },
                 Err(e) => {
                     if e.errno() == libc::EAGAIN || e.errno() == libc::EINTR {

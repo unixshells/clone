@@ -66,8 +66,8 @@ pub const KVM_ARM_VCPU_POWER_OFF: u32 = 0;
 pub const KVM_CREATE_DEVICE: u64 = 0xC00CAEE0;
 /// KVM_SET_DEVICE_ATTR = _IOW(0xAE, 0xe1, kvm_device_attr)
 pub const KVM_SET_DEVICE_ATTR: u64 = 0x4018AEE1;
-/// KVM_GET_DEVICE_ATTR = _IOWR(0xAE, 0xe0, kvm_device_attr)
-pub const KVM_GET_DEVICE_ATTR: u64 = 0xC018AEE0;
+/// KVM_GET_DEVICE_ATTR = _IOWR(0xAE, 0xe0, kvm_device_attr) — dir=2 (_IOC_READ)
+pub const KVM_GET_DEVICE_ATTR: u64 = 0x8018AEE0;
 /// KVM_DEV_ARM_VGIC_GRP_DIST_REGS.
 pub const KVM_DEV_ARM_VGIC_GRP_DIST_REGS: u32 = 1;
 /// KVM_SET_ONE_REG = _IOW(0xAE, 0xac, kvm_one_reg)

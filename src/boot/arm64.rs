@@ -57,6 +57,9 @@ pub const KVM_VGIC_V3_ADDR_TYPE_REDIST: u64 = 3;
 pub const KVM_ARM_TARGET_GENERIC_V8: u32 = 5;
 /// KVM_ARM_VCPU_PSCI_0_2 bit index.
 pub const KVM_ARM_VCPU_PSCI_0_2: u32 = 2;
+/// KVM_ARM_VCPU_POWER_OFF bit index (start non-BSP vCPUs powered off so
+/// guest PSCI CPU_ON works — see Vcpu::new).
+pub const KVM_ARM_VCPU_POWER_OFF: u32 = 0;
 
 /// KVM_CREATE_DEVICE = _IOWR(0xAE, 0xe0, kvm_create_device)
 /// (struct kvm_create_device = 3×u32 = 12 bytes)

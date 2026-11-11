@@ -279,6 +279,13 @@ impl Vcpu {
                 features: [0u32; 7],
             };
             vi.features[0] |= 1u32 << arm64::KVM_ARM_VCPU_PSCI_0_2;
+            // Non-BSP vCPUs must start POWERED OFF, or the guest's PSCI
+            // CPU_ON returns ALREADY_ON (mapped to -EINVAL/-22) and SMP
+            // never comes up — CPU1 never boots. Verified on-device: with
+            // this bit, "smp: Brought up 1 node, 2 CPUs".
+            if id != 0 {
+                vi.features[0] |= 1u32 << arm64::KVM_ARM_VCPU_POWER_OFF;
+            }
             let ret = unsafe {
                 crate::sys::ioctl(
                     fd.as_raw_fd(),

@@ -156,9 +156,10 @@ impl FdtBuilder {
     }
 
     fn prop(&mut self, name: &str, data: &[u8]) {
+        let name_off = self.name_off(name);
         self.put32(3); // FDT_PROP
         self.put32(data.len() as u32);
-        self.put32(self.name_off(name));
+        self.put32(name_off);
         self.st.extend_from_slice(data);
         while self.st.len() % 4 != 0 {
             self.st.push(0);

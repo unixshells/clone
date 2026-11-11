@@ -293,12 +293,12 @@ impl Vcpu {
             }
             // BSP enters at the Image load address with x0 = DTB phys addr.
             if id == 0 {
-                set_arm64_core_reg(
+                Self::set_arm64_core_reg(
                     fd.as_raw_fd(),
                     arm64::REG_ID_X0,
                     arm64::GUEST_DTB_ADDR.load(Ordering::Relaxed),
                 )?;
-                set_arm64_core_reg(fd.as_raw_fd(), arm64::REG_ID_PC, entry_addr.0)?;
+                Self::set_arm64_core_reg(fd.as_raw_fd(), arm64::REG_ID_PC, entry_addr.0)?;
             }
         }
 

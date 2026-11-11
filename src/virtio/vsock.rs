@@ -193,6 +193,7 @@ impl VirtioVsock {
             queue_configs: Vec::new(),
             guest_mem: std::ptr::null_mut(),
             guest_mem_size: 0,
+            mem_base: 0,
             hole_start: 0,
             hole_end: 0,
             last_avail: [0; NUM_QUEUES],

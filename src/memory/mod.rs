@@ -233,6 +233,7 @@ pub fn create_guest_memory_with_hole(size: u64, hole_start: u64, hole_end: u64) 
     Ok(GuestMem {
         ptr: ptr as *mut u8,
         size,
+        base: 0,
         hole_start,
         hole_end,
     })

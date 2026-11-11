@@ -956,17 +956,7 @@ impl Vm {
         Ok(())
     }
 
-    /// Inject a device IRQ line. x86: raw IRQ line. aarch64: KVM_IRQ_LINE
-/// takes a composite word `type<<24 | vcpu<<16 | num` — SPI injection is
-/// `KVM_ARM_IRQ_TYPE_SPI=1` (see dom0/kvmhost.c vblk_inject, proven on the
-/// 5.10 vendor kernel). No-op error return: lines are edge-pulsed.
-fn set_spi_line(vm_fd: &VmFd, irq: u32, active: bool) {
-    #[cfg(target_arch = "aarch64")]
-    let irq = (1u32 << 24) | (irq & 0xFFFF);
-    let _ = vm_fd.set_irq_line(irq, active);
-}
-
-pub fn run(&mut self) -> Result<()> {
+    pub fn run(&mut self) -> Result<()> {
         // Install signal handlers for clean shutdown (closes vhost fds on SIGTERM)
         vcpu::install_signal_handlers();
         // Install SIGUSR1 handler for vCPU pause (no-op, just interrupts KVM_RUN)
@@ -1535,4 +1525,15 @@ pub fn setup_gsi_routing(vm_fd: &VmFd) -> Result<()> {
 
     tracing::info!("GSI routing configured: 24 IOAPIC + 16 PIC entries");
     Ok(())
+}
+
+/// Inject a device IRQ line. x86: raw IRQ line. aarch64: KVM_IRQ_LINE
+/// takes a composite word `type<<24 | vcpu<<16 | num` — SPI injection is
+/// `KVM_ARM_IRQ_TYPE_SPI=1` (see dom0/kvmhost.c vblk_inject, proven on the
+/// 5.10 vendor kernel). Lines are edge-pulsed by the callers.
+#[allow(unused_variables)]
+fn set_spi_line(vm_fd: &VmFd, irq: u32, active: bool) {
+    #[cfg(target_arch = "aarch64")]
+    let irq = (1u32 << 24) | (irq & 0xFFFF);
+    let _ = vm_fd.set_irq_line(irq, active);
 }

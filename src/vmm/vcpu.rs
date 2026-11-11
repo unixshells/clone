@@ -276,7 +276,7 @@ impl Vcpu {
         {
             let mut vi = arm64::KvmVcpuInit {
                 target: arm64::KVM_ARM_TARGET_GENERIC_V8,
-                features: [0u32; 32],
+                features: [0u32; 7],
             };
             vi.features[0] |= 1u32 << arm64::KVM_ARM_VCPU_PSCI_0_2;
             let ret = unsafe {

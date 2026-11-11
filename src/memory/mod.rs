@@ -99,7 +99,7 @@ impl GuestMem {
         if self.hole_start == 0 {
             // No hole — direct mapping
             if rel >= self.size {
-                anyhow::bail!("GPA {gpa:#x} exceeds memory size {:#x} (base {:#x})", gpa, self.base + self.size, self.base);
+                anyhow::bail!("GPA {gpa:#x} exceeds memory size {:#x} (base {:#x})", self.base + self.size, self.base);
             }
             return Ok(rel as usize);
         }
@@ -111,11 +111,11 @@ impl GuestMem {
             // Above the hole — subtract the hole size
             let offset = self.hole_start + (rel - self.hole_end);
             if offset >= self.size {
-                anyhow::bail!("GPA {gpa:#x} (offset {offset:#x}) exceeds memory size {:#x}", gpa, self.size);
+                anyhow::bail!("GPA {gpa:#x} (offset {offset:#x}) exceeds memory size {:#x}", self.size);
             }
             Ok(offset as usize)
         } else {
-            anyhow::bail!("GPA {gpa:#x} is in the MMIO hole ({:#x}..{:#x})", gpa, self.base + self.hole_start, self.base + self.hole_end);
+            anyhow::bail!("GPA {gpa:#x} is in the MMIO hole ({:#x}..{:#x})", self.base + self.hole_start, self.base + self.hole_end);
         }
     }
 

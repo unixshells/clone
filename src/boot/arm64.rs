@@ -340,7 +340,12 @@ pub fn build_dtb(
     b.prop_str("compatible", "arm,gic-v3");
     b.prop_str("interrupt-controller", "");
     b.prop_u32("phandle", &[1]);
-    b.prop_u32("#interrupt-cells", &[1]);
+    // 3 cells (type, number, flags) — with 1 cell the kernel parses the
+    // 3-cell interrupt specs as garbage and request_threaded_irq fails
+    // with -EINVAL ("arch_timer: No interrupt available" is the same
+    // breakage). kvmhost.c got away with 1 cell only because its boot
+    // never probed an IRQ-driven device.
+    b.prop_u32("#interrupt-cells", &[3]);
     b.prop_u32("#address-cells", &[1]);
     b.prop_u32("reg", &gicreg);
     b.end_node();

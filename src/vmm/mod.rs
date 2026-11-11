@@ -1607,3 +1607,6 @@ pub fn dbg_vgic_dump_spi(intid: u32) {
         ispend & (1 << bit) != 0,
     );
 }
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn dbg_vgic_dump_spi(_intid: u32) {}

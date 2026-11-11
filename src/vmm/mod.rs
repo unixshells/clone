@@ -1534,11 +1534,16 @@ pub fn setup_gsi_routing(vm_fd: &VmFd) -> Result<()> {
 
 /// Inject a device IRQ line. x86: raw IRQ line. aarch64: KVM_IRQ_LINE
 /// takes a composite word `type<<24 | vcpu<<16 | num` — SPI injection is
-/// `KVM_ARM_IRQ_TYPE_SPI=1` (see dom0/kvmhost.c vblk_inject, proven on the
-/// 5.10 vendor kernel). Lines are edge-pulsed by the callers.
+/// `KVM_ARM_IRQ_TYPE_SPI=1` and the number is the GIC **INTID** (SPI
+/// number + 32), like kvmtool's `spi_irq + 32` and QEMU's
+/// `irq + GIC_INTERNAL`. Passing the bare SPI number fails the kernel's
+/// `irqid < 32` check with -EINVAL (verified on-device via strace:
+/// ioctl(4, KVM_IRQ_LINE, ...) = -1 EINVAL — the block-device kick was
+/// reaching clone but the injection was rejected, so virtio I/O hung).
+/// Lines are edge-pulsed by the callers.
 #[allow(unused_variables)]
 fn set_spi_line(vm_fd: &VmFd, irq: u32, active: bool) {
     #[cfg(target_arch = "aarch64")]
-    let irq = (1u32 << 24) | (irq & 0xFFFF);
+    let irq = (1u32 << 24) | ((irq + 32) & 0xFFFF);
     let _ = vm_fd.set_irq_line(irq, active);
 }

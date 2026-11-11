@@ -879,6 +879,7 @@ impl Vm {
                 Arc::clone(&self.serial),
             )?;
             // Notify guest this vCPU was paused (prevents soft lockup watchdog)
+            #[cfg(target_arch = "x86_64")]
             let _ = vcpu.fd().kvmclock_ctrl();
             self.vcpus.push(vcpu);
         }

@@ -655,9 +655,6 @@ impl Vcpu {
         Ok(serde_json::to_vec(&all_entries).unwrap_or_default())
     }
 
-    /// run_loop deferred TSC_DEADLINE handling — x86 only (arm64 vCPUs have
-    /// no LAPIC; the arch timer is managed in-kernel via the vGIC).
-    #[cfg(target_arch = "x86_64")]
     /// Check if a pause has been requested and handle it.
     ///
     /// Captures register state, increments paused count, notifies the
@@ -777,6 +774,7 @@ impl Vcpu {
                         ExitAction::IoIn { port }
                     }
                     VcpuExit::MmioRead(addr, data) => {
+                        let mut handled = false;
                         // aarch64: PL011 UART window — earlycon reads return
                         // all-clear flags (0), which keeps the kernel's TX
                         // poll loop moving.
@@ -785,9 +783,8 @@ impl Vcpu {
                             && addr < crate::boot::arm64::PL011_BASE + crate::boot::arm64::PL011_SIZE
                         {
                             data.fill(0x00);
-                            return Ok(ExitAction::MmioRead { addr, len: data.len() });
+                            handled = true;
                         }
-                        let mut handled = false;
                         // Try PCI bus first (ECAM + BAR regions)
                         if let Some(ref pci_bus) = self.pci_bus {
                             let bus = pci_bus.lock().unwrap();
@@ -818,7 +815,6 @@ impl Vcpu {
                             let mut lock = out.lock();
                             let _ = lock.write_all(data);
                             let _ = lock.flush();
-                            return Ok(ExitAction::MmioWrite { addr, data_bytes: [0u8; 8], len: data.len() });
                         }
                         let len = data.len();
                         let mut data_bytes = [0u8; 8];
@@ -826,7 +822,14 @@ impl Vcpu {
                         data_bytes[..copy_len].copy_from_slice(&data[..copy_len]);
                         ExitAction::MmioWrite { addr, data_bytes, len }
                     }
-                    VcpuExit::Debug(dbg_info) => ExitAction::Debug { pc: dbg_info.pc, dr6: dbg_info.dr6 },
+                    VcpuExit::Debug(dbg_info) => {
+                        // x86-only fields (pc/dr6); aarch64 has no DR registers.
+                        #[cfg(target_arch = "x86_64")]
+                        let action = ExitAction::Debug { pc: dbg_info.pc, dr6: dbg_info.dr6 };
+                        #[cfg(not(target_arch = "x86_64"))]
+                        let action = ExitAction::Debug { pc: 0, dr6: 0 };
+                        action
+                    }
                     other => ExitAction::Unknown(format!("{:?}", other)),
                 },
                 Err(e) => {
@@ -967,7 +970,6 @@ impl Vcpu {
 /// The kernel reads CMOS during boot for time-of-day and hardware detection.
 /// Critical: register 0x0A bit 7 must be 0 (no update in progress) or the
 /// kernel spins forever waiting for the RTC update cycle to finish.
-#[cfg(target_arch = "x86_64")]
 fn cmos_read(index: u8) -> u8 {
     match index {
         // RTC time registers — return epoch-ish values (BCD format)

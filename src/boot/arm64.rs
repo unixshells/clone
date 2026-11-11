@@ -190,21 +190,12 @@ impl FdtBuilder {
     }
 
     fn finish(self) -> Vec<u8> {
-        let mut dtb = vec![0u8; FDT_STRUCT_OFF];
-        let mut strings = self.strings;
-        while strings.len() % 4 != 0 {
-            strings.push(0);
-        }
-        let st_padded = {
-            let mut s = self.st;
-            while s.len() % 4 != 0 {
-                s.push(0);
-            }
-            s
-        };
-        let strings_off = (FDT_STRUCT_OFF + st_padded.len()) as u32;
-        let total = strings_off + strings.len() as u32;
+        let strings_len = (self.strings.len() + 3) & !3;
+        let struct_len = self.st.len();
+        let strings_off = (FDT_STRUCT_OFF + ((struct_len + 3) & !3)) as u32;
+        let total = strings_off + strings_len as u32;
 
+        let mut dtb = vec![0u8; strings_off as usize + strings_len];
         let mut w = |off: usize, v: u32| dtb[off..off + 4].copy_from_slice(&v.to_be_bytes());
         w(0, FDT_MAGIC);
         w(4, total);
@@ -214,10 +205,18 @@ impl FdtBuilder {
         w(20, 17); // version
         w(24, 16); // last_comp_version
         w(28, 0); // boot_cpuid_phys
-        w(32, strings.len() as u32); // size_dt_strings
-        w(36, self.st.len() as u32); // size_dt_struct
+        w(32, strings_len as u32); // size_dt_strings
+        w(36, struct_len as u32); // size_dt_struct
 
-        dtb.extend_from_slice(&st_padded);
+        let mut st = self.st;
+        while st.len() % 4 != 0 {
+            st.push(0);
+        }
+        dtb.extend_from_slice(&st);
+        let mut strings = self.strings;
+        while strings.len() % 4 != 0 {
+            strings.push(0);
+        }
         dtb.extend_from_slice(&strings);
         dtb
     }

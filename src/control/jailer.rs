@@ -101,6 +101,7 @@ mod linux_syscalls {
             libc::SYS_set_robust_list as i32,
             libc::SYS_get_robust_list as i32,
             libc::SYS_prctl as i32,
+            #[cfg(target_arch = "x86_64")]
             libc::SYS_arch_prctl as i32,
             libc::SYS_clone as i32,
             libc::SYS_clone3 as i32,
@@ -108,8 +109,10 @@ mod linux_syscalls {
             // Epoll
             libc::SYS_epoll_create1 as i32,
             libc::SYS_epoll_ctl as i32,
+            #[cfg(any(target_arch = "x86_64", target_arch = "arm"))]
             libc::SYS_epoll_wait as i32,
             libc::SYS_epoll_pwait as i32,
+            #[cfg(any(target_arch = "x86_64", target_arch = "arm"))]
             libc::SYS_poll as i32,
             libc::SYS_eventfd2 as i32,
             libc::SYS_timerfd_create as i32,

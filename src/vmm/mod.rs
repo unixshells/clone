@@ -1580,6 +1580,8 @@ fn dbg_vgic_read_reg(group: u32, attr: u64) -> u32 {
         )
     };
     if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!("vgic GET_DEVICE_ATTR group={group} attr={attr:#x} failed: {err}");
         return 0xFFFF_FFFF;
     }
     val

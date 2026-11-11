@@ -533,6 +533,7 @@ impl Vm {
                 ));
             }
             let vgic_fd = cd.fd;
+            crate::vmm::dbg_store_vgic_fd(vgic_fd);
 
             let set_attr = |group: u32, attr: u64, val: u64| -> Result<()> {
                 let mut attr_data = val;
@@ -1550,4 +1551,59 @@ fn set_spi_line(vm_fd: &VmFd, irq: u32, active: bool) {
         tracing::warn!("set_irq_line({irq:#x}, {active}) failed: {e}");
     }
     let _ = ret;
+}
+
+// TEMP DEBUG: vgic fd stashed for post-injection state dumps.
+static VGIC_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+pub fn dbg_store_vgic_fd(fd: i32) {
+    VGIC_FD.store(fd, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn dbg_vgic_read_reg(group: u32, attr: u64) -> u32 {
+    let vgic_fd = VGIC_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if vgic_fd < 0 {
+        return 0xDEADBEEF;
+    }
+    let mut val: u32 = 0;
+    let a = crate::boot::arm64::KvmDeviceAttr {
+        flags: 0,
+        group,
+        attr,
+        addr: &mut val as *mut u32 as u64,
+    };
+    let ret = unsafe {
+        crate::sys::ioctl(
+            vgic_fd,
+            crate::boot::arm64::KVM_GET_DEVICE_ATTR,
+            &a as *const _ as *mut libc::c_void,
+        )
+    };
+    if ret < 0 {
+        return 0xFFFF_FFFF;
+    }
+    val
+}
+
+/// TEMP DEBUG: after injecting an SPI, dump the vGIC state that determines
+/// whether the guest can possibly take it (CTLR, ISENABLER, ISPENDR for the
+/// intid, and IROUTER). Called from the run loop for virtio kicks.
+#[cfg(target_arch = "aarch64")]
+pub fn dbg_vgic_dump_spi(intid: u32) {
+    if VGIC_FD.load(std::sync::atomic::Ordering::SeqCst) < 0 {
+        return;
+    }
+    let ena_off = 0x100u64 + ((intid / 32) * 4) as u64;
+    let pend_off = 0x200u64 + ((intid / 32) * 4) as u64;
+    let irouter_off = 0x6000u64 + ((intid - 32) * 8) as u64;
+    let ctlr = dbg_vgic_read_reg(1, 0x0);
+    let isena = dbg_vgic_read_reg(1, ena_off);
+    let ispend = dbg_vgic_read_reg(1, pend_off);
+    let irouter = dbg_vgic_read_reg(1, irouter_off);
+    let bit = intid % 32;
+    tracing::info!(
+        "vgic-dump intid={intid}: CTLR={ctlr:#x} ISENABLER[{ena_off:#x}]={isena:#x} (bit{bit}={}) ISPENDR[{pend_off:#x}]={ispend:#x} (bit{bit}={}) IROUTER[{irouter_off:#x}]={irouter:#x}",
+        isena & (1 << bit) != 0,
+        ispend & (1 << bit) != 0,
+    );
 }

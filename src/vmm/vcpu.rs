@@ -984,6 +984,7 @@ impl Vcpu {
                             // balloon paths which already use set_spi_line.
                             crate::vmm::set_spi_line(&self.vm_fd, irq, true);
                             crate::vmm::set_spi_line(&self.vm_fd, irq, false);
+                            crate::vmm::dbg_vgic_dump_spi(irq + 32);
                         }
                     }
                 }

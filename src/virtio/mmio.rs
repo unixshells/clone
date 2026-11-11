@@ -401,6 +401,11 @@ impl MmioTransport {
             }
             reg::QUEUE_NOTIFY => {
                 let queue_idx = val as u16;
+                tracing::info!(
+                    "virtio-mmio QUEUE_NOTIFY q={queue_idx} dev={:?} ready={}",
+                    self.device.device_type(),
+                    self.virtqueues.get(queue_idx as usize).map(|q| q.is_ready()).unwrap_or(false)
+                );
                 if let Err(e) = self.device.process_queue(queue_idx) {
                     tracing::error!("Error processing queue {val}: {e}");
                 }

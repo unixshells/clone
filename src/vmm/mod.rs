@@ -1545,5 +1545,9 @@ pub fn setup_gsi_routing(vm_fd: &VmFd) -> Result<()> {
 fn set_spi_line(vm_fd: &VmFd, irq: u32, active: bool) {
     #[cfg(target_arch = "aarch64")]
     let irq = (1u32 << 24) | ((irq + 32) & 0xFFFF);
-    let _ = vm_fd.set_irq_line(irq, active);
+    let ret = vm_fd.set_irq_line(irq, active);
+    if let Err(e) = ret {
+        tracing::warn!("set_irq_line({irq:#x}, {active}) failed: {e}");
+    }
+    let _ = ret;
 }

@@ -775,14 +775,24 @@ impl Vcpu {
                     }
                     VcpuExit::MmioRead(addr, data) => {
                         let mut handled = false;
-                        // aarch64: PL011 UART window — earlycon reads return
-                        // all-clear flags (0), which keeps the kernel's TX
-                        // poll loop moving.
+                        // aarch64: PL011 UART window. The Flag Register (0x18)
+                        // must report TXFE|RXFE set (0x90): the kernel console
+                        // path polls FR waiting for "TX FIFO empty" to be
+                        // SET — returning 0 leaves it spinning forever after
+                        // the first store (proven with a ctypes replica).
+                        // Other PL011 reads return 0 (all-clear).
                         #[cfg(target_arch = "aarch64")]
                         if addr >= crate::boot::arm64::PL011_BASE
                             && addr < crate::boot::arm64::PL011_BASE + crate::boot::arm64::PL011_SIZE
                         {
                             data.fill(0x00);
+                            if (addr - crate::boot::arm64::PL011_BASE) == 0x18 {
+                                // FR: CTS|DSR|DCD|BUSY|RXFE|TXFF|RXFF|TXFE
+                                // = TXFE (bit 7) | RXFE (bit 4) = 0x90
+                                if let Some(first) = data.first_mut() {
+                                    *first = 0x90;
+                                }
+                            }
                             handled = true;
                         }
                         // Try PCI bus first (ECAM + BAR regions)
@@ -806,6 +816,8 @@ impl Vcpu {
                     VcpuExit::MmioWrite(addr, data) => {
                         // aarch64: PL011 UART window — forward bytes to the
                         // host console (guest earlycon/console=ttyAMA0).
+                        // A store to DR may be a 32-bit access; the character
+                        // is the low byte, so forward data[0] only.
                         #[cfg(target_arch = "aarch64")]
                         if addr >= crate::boot::arm64::PL011_BASE
                             && addr < crate::boot::arm64::PL011_BASE + crate::boot::arm64::PL011_SIZE
@@ -813,7 +825,7 @@ impl Vcpu {
                             use std::io::Write;
                             let out = std::io::stdout();
                             let mut lock = out.lock();
-                            let _ = lock.write_all(data);
+                            let _ = lock.write_all(&data[..1]);
                             let _ = lock.flush();
                         }
                         let len = data.len();

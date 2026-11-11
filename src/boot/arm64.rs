@@ -200,7 +200,7 @@ impl FdtBuilder {
         let strings_off = (FDT_STRUCT_OFF + ((struct_len + 3) & !3)) as u32;
         let total = strings_off + strings_len as u32;
 
-        let mut dtb = vec![0u8; strings_off as usize + strings_len];
+        let mut dtb = vec![0u8; total as usize];
         let mut w = |off: usize, v: u32| dtb[off..off + 4].copy_from_slice(&v.to_be_bytes());
         w(0, FDT_MAGIC);
         w(4, total);
@@ -217,12 +217,17 @@ impl FdtBuilder {
         while st.len() % 4 != 0 {
             st.push(0);
         }
-        dtb.extend_from_slice(&st);
+        // Struct and strings must land exactly at the header offsets inside
+        // the preallocated buffer — extend_from_slice() here appended them
+        // past the end of the blob, leaving all-zero bytes at off_dt_struct
+        // (guest spun silently before earlycon).
+        dtb[FDT_STRUCT_OFF..FDT_STRUCT_OFF + st.len()].copy_from_slice(&st);
         let mut strings = self.strings;
         while strings.len() % 4 != 0 {
             strings.push(0);
         }
-        dtb.extend_from_slice(&strings);
+        dtb[strings_off as usize..strings_off as usize + strings.len()]
+            .copy_from_slice(&strings);
         dtb
     }
 }

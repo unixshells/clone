@@ -67,7 +67,9 @@ pub const KVM_SET_DEVICE_ATTR: u64 = 0x4018AEE1;
 pub const KVM_SET_ONE_REG: u64 = 0x4010AEAC;
 /// KVM_ARM_VCPU_INIT = _IOW(0xAE, 0xae, kvm_vcpu_init)
 /// (struct kvm_vcpu_init = target u32 + features[7] u32 = 32 bytes)
-pub const KVM_ARM_VCPU_INIT: u64 = 0x4020AEEE;
+/// NOTE: nr is 0xAE, so the number ends in …AEAE (verified against
+/// /usr/include/linux/kvm.h and kvmhost.c — 0x4020AEEE is wrong).
+pub const KVM_ARM_VCPU_INIT: u64 = 0x4020AEAE;
 
 /// KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | offset/4
 /// KVM_REG_ARM64=0x6000_0000_0000_0000, SIZE_U64=0x0030_0000_0000_0000,

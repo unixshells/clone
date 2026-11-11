@@ -803,6 +803,9 @@ impl MmioBus {
             } else {
                 None
             };
+            tracing::info!(
+                "virtio-mmio write addr={addr:#x} off={offset:#x} had={had_interrupt} has={has_interrupt} inject={inject:?}"
+            );
             (true, inject)
         } else {
             (false, None)

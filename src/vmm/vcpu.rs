@@ -975,8 +975,15 @@ impl Vcpu {
                             tracing::warn!("MMIO write: unhandled addr={addr:#x}, len={len}");
                         }
                         if let Some(irq) = irq {
-                            let _ = self.vm_fd.set_irq_line(irq, true);
-                            let _ = self.vm_fd.set_irq_line(irq, false);
+                            // aarch64: virtio kicks must be injected as SPIs
+                            // (KVM_IRQ_LINE word type<<24|num with
+                            // KVM_ARM_IRQ_TYPE_SPI) — a raw irq number means
+                            // IRQ_TYPE_CPU (a PPI/CPU line) and the guest
+                            // virtio driver never sees its interrupt, so
+                            // block I/O hangs forever. Same as the vsock/
+                            // balloon paths which already use set_spi_line.
+                            crate::vmm::set_spi_line(&self.vm_fd, irq, true);
+                            crate::vmm::set_spi_line(&self.vm_fd, irq, false);
                         }
                     }
                 }

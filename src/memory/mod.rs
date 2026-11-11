@@ -23,6 +23,10 @@ const GUEST_MEM_START: u64 = 0;
 pub struct GuestMem {
     ptr: *mut u8,
     size: u64, // total mmap'd size (contiguous userspace allocation)
+    /// GPA base of the backing slot. 0 on x86 (slot 0 at GPA 0). On arm64
+    /// the single slot is registered at GPA 0x40000000 (kvmhost layout), so
+    /// all GPA→HVA translation subtracts this.
+    base: u64,
     /// For VMs > 3GB, the MMIO hole splits guest physical address space:
     /// GPA [0, hole_start) maps to userspace [ptr, ptr+hole_start)
     /// GPA [hole_end, ...) maps to userspace [ptr+hole_start, ...)
@@ -34,7 +38,7 @@ pub struct GuestMem {
 impl GuestMem {
     /// Create a GuestMem from a raw pointer and size (no MMIO hole).
     pub fn from_raw(ptr: *mut u8, size: u64) -> Self {
-        Self { ptr, size, hole_start: 0, hole_end: 0 }
+        Self { ptr, size, base: 0, hole_start: 0, hole_end: 0 }
     }
 
     /// Create a GuestMem with an MMIO hole for large VMs.
@@ -42,17 +46,26 @@ impl GuestMem {
     /// - GPA [0, hole_start) → userspace [ptr, ptr+hole_start)
     /// - GPA [hole_end, ...) → userspace [ptr+hole_start, ...)
     pub fn from_raw_with_hole(ptr: *mut u8, size: u64, hole_start: u64, hole_end: u64) -> Self {
-        Self { ptr, size, hole_start, hole_end }
+        Self { ptr, size, base: 0, hole_start, hole_end }
+    }
+
+    /// Override the GPA base of the backing slot (arm64: 0x40000000).
+    pub fn set_base(&mut self, base: u64) {
+        self.base = base;
+    }
+
+    pub fn base(&self) -> u64 {
+        self.base
     }
 
     /// Create a temporary borrow of existing guest memory.
     pub unsafe fn borrow_raw(ptr: *mut u8, size: u64) -> BorrowedGuestMem {
-        BorrowedGuestMem { inner: GuestMem { ptr, size, hole_start: 0, hole_end: 0 } }
+        BorrowedGuestMem { inner: GuestMem { ptr, size, base: 0, hole_start: 0, hole_end: 0 } }
     }
 
     /// Create a temporary borrow with MMIO hole info.
     pub unsafe fn borrow_raw_with_hole(ptr: *mut u8, size: u64, hole_start: u64, hole_end: u64) -> BorrowedGuestMem {
-        BorrowedGuestMem { inner: GuestMem { ptr, size, hole_start, hole_end } }
+        BorrowedGuestMem { inner: GuestMem { ptr, size, base: 0, hole_start, hole_end } }
     }
 
     pub fn as_ptr(&self) -> *mut u8 {
@@ -76,28 +89,33 @@ impl GuestMem {
     }
 
     /// Translate a guest physical address (GPA) to a userspace pointer offset.
-    /// Accounts for the MMIO hole if present.
+    /// Accounts for the GPA base (arm64 slot at 0x40000000) and the MMIO hole
+    /// if present.
     fn gpa_to_offset(&self, gpa: u64) -> Result<usize> {
+        if gpa < self.base {
+            anyhow::bail!("GPA {gpa:#x} is below the guest memory base {:#x}", self.base);
+        }
+        let rel = gpa - self.base;
         if self.hole_start == 0 {
             // No hole — direct mapping
-            if gpa >= self.size {
-                anyhow::bail!("GPA {gpa:#x} exceeds memory size {:#x}", self.size);
+            if rel >= self.size {
+                anyhow::bail!("GPA {gpa:#x} exceeds memory size {:#x} (base {:#x})", gpa, self.base + self.size, self.base);
             }
-            return Ok(gpa as usize);
+            return Ok(rel as usize);
         }
 
-        if gpa < self.hole_start {
+        if rel < self.hole_start {
             // Below the hole — direct mapping
-            Ok(gpa as usize)
-        } else if gpa >= self.hole_end {
+            Ok(rel as usize)
+        } else if rel >= self.hole_end {
             // Above the hole — subtract the hole size
-            let offset = self.hole_start + (gpa - self.hole_end);
+            let offset = self.hole_start + (rel - self.hole_end);
             if offset >= self.size {
-                anyhow::bail!("GPA {gpa:#x} (offset {offset:#x}) exceeds memory size {:#x}", self.size);
+                anyhow::bail!("GPA {gpa:#x} (offset {offset:#x}) exceeds memory size {:#x}", gpa, self.size);
             }
             Ok(offset as usize)
         } else {
-            anyhow::bail!("GPA {gpa:#x} is in the MMIO hole ({:#x}..{:#x})", self.hole_start, self.hole_end);
+            anyhow::bail!("GPA {gpa:#x} is in the MMIO hole ({:#x}..{:#x})", gpa, self.base + self.hole_start, self.base + self.hole_end);
         }
     }
 

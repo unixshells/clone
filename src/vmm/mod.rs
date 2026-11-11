@@ -128,26 +128,72 @@ impl Vm {
 
         // 1. Set up guest memory with overcommit (MAP_NORESERVE)
         let mem_size = (self.config.mem_mb as u64) << 20;
-        let guard_size: u64 = 128 << 20; // 128MB guard past e820 end
-        let mmio_hole_start: u64 = 0xC000_0000; // 3 GB — MMIO hole starts here
-        let mmio_hole_end: u64 = 0x1_0000_0000; // 4 GB — MMIO hole ends here
 
-        let alloc_size = if mem_size <= mmio_hole_start {
-            mem_size + guard_size
-        } else {
-            mmio_hole_start + (mem_size - mmio_hole_start) + guard_size
+        // aarch64 (kvmhost layout): one contiguous slot at GPA 0x40000000 —
+        // the arm64 kernel Image is loaded at RAM_BASE+0x80000 and the DTB
+        // advertises memory@40000000, so nothing may live below RAM_BASE.
+        #[cfg(target_arch = "aarch64")]
+        let (alloc_size, guest_memory) = {
+            let gm = memory::create_guest_memory(mem_size)
+                .context("Failed to create guest memory")?;
+            let mut gm = gm;
+            gm.set_base(crate::boot::arm64::RAM_BASE);
+            (mem_size, gm)
         };
 
-        let guest_memory = if mem_size <= mmio_hole_start {
-            memory::create_guest_memory(alloc_size)
-                .context("Failed to create guest memory")?
-        } else {
-            memory::create_guest_memory_with_hole(alloc_size, mmio_hole_start, mmio_hole_end)
-                .context("Failed to create guest memory")?
+        // x86_64: GPA 0 layout with the 3-4GB MMIO hole for VMs > 3GB.
+        #[cfg(target_arch = "x86_64")]
+        let (alloc_size, guest_memory) = {
+            let guard_size: u64 = 128 << 20; // 128MB guard past e820 end
+            let mmio_hole_start: u64 = 0xC000_0000; // 3 GB — MMIO hole starts here
+            let mmio_hole_end: u64 = 0x1_0000_0000; // 4 GB — MMIO hole ends here
+
+            let alloc_size = if mem_size <= mmio_hole_start {
+                mem_size + guard_size
+            } else {
+                mmio_hole_start + (mem_size - mmio_hole_start) + guard_size
+            };
+
+            let gm = if mem_size <= mmio_hole_start {
+                memory::create_guest_memory(alloc_size)
+                    .context("Failed to create guest memory")?
+            } else {
+                memory::create_guest_memory_with_hole(alloc_size, mmio_hole_start, mmio_hole_end)
+                    .context("Failed to create guest memory")?
+            };
+            (alloc_size, gm)
         };
 
         // 2. Register memory region(s) with KVM
-        if !guest_memory.has_hole() {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mem_region = kvm_userspace_memory_region {
+                slot: 0,
+                guest_phys_addr: crate::boot::arm64::RAM_BASE,
+                memory_size: mem_size,
+                userspace_addr: guest_memory.as_ptr() as u64,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            unsafe {
+                self.vm_fd
+                    .set_user_memory_region(mem_region)
+                    .context("Failed to set KVM memory region (arm64 @0x40000000)")?;
+            }
+            self.kvm_slot_size = mem_size;
+            tracing::info!(
+                "arm64 memory: slot @0x40000000, {}MB, slab at {:#x}",
+                mem_size >> 20,
+                guest_memory.as_ptr() as u64
+            );
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let guard_size: u64 = 128 << 20;
+            let mmio_hole_start: u64 = 0xC000_0000;
+            let mmio_hole_end: u64 = 0x1_0000_0000;
+
+            if !guest_memory.has_hole() {
             // Small VM: single KVM slot
             let mem_region = kvm_userspace_memory_region {
                 slot: 0,
@@ -161,7 +207,8 @@ impl Vm {
                     .set_user_memory_region(mem_region)
                     .context("Failed to set KVM memory region")?;
             }
-        } else {
+            self.kvm_slot_size = alloc_size;
+            } else {
             // Large VM: two KVM slots around the MMIO hole
             let above_hole = mem_size - mmio_hole_start;
 
@@ -199,6 +246,7 @@ impl Vm {
                 mmio_hole_end, above_hole >> 20,
                 mem_size >> 20,
             );
+            }
         }
 
         let t_memory = boot_start.elapsed();
@@ -895,8 +943,8 @@ impl Vm {
                 transport.vhost_interrupt().fetch_or(1, std::sync::atomic::Ordering::Release);
             }
             drop(bus);
-            let _ = self.vm_fd.set_irq_line(irq, true);
-            let _ = self.vm_fd.set_irq_line(irq, false);
+            let _ = set_spi_line(&self.vm_fd, irq, true);
+            let _ = set_spi_line(&self.vm_fd, irq, false);
         }
 
         tracing::info!(
@@ -908,7 +956,17 @@ impl Vm {
         Ok(())
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    /// Inject a device IRQ line. x86: raw IRQ line. aarch64: KVM_IRQ_LINE
+/// takes a composite word `type<<24 | vcpu<<16 | num` — SPI injection is
+/// `KVM_ARM_IRQ_TYPE_SPI=1` (see dom0/kvmhost.c vblk_inject, proven on the
+/// 5.10 vendor kernel). No-op error return: lines are edge-pulsed.
+fn set_spi_line(vm_fd: &VmFd, irq: u32, active: bool) {
+    #[cfg(target_arch = "aarch64")]
+    let irq = (1u32 << 24) | (irq & 0xFFFF);
+    let _ = vm_fd.set_irq_line(irq, active);
+}
+
+pub fn run(&mut self) -> Result<()> {
         // Install signal handlers for clean shutdown (closes vhost fds on SIGTERM)
         vcpu::install_signal_handlers();
         // Install SIGUSR1 handler for vCPU pause (no-op, just interrupts KVM_RUN)
@@ -940,8 +998,8 @@ impl Vm {
                 // Raise IRQ 4 if the guest enabled data-available interrupts (IER bit 0)
                 if serial.interrupt_enabled() {
                     drop(serial); // release lock before ioctl
-                    let _ = vm_fd_clone.set_irq_line(4, true);
-                    let _ = vm_fd_clone.set_irq_line(4, false);
+                    let _ = set_spi_line(&vm_fd_clone, 4, true);
+                    let _ = set_spi_line(&vm_fd_clone, 4, false);
                 }
             }
         });
@@ -997,8 +1055,8 @@ impl Vm {
                             }
                         }
                         // Inject IRQ (edge-triggered)
-                        let _ = vm_fd_clone.set_irq_line(irq, true);
-                        let _ = vm_fd_clone.set_irq_line(irq, false);
+                        let _ = set_spi_line(&vm_fd_clone, irq, true);
+                        let _ = set_spi_line(&vm_fd_clone, irq, false);
                     }
                 }
             });
@@ -1013,8 +1071,8 @@ impl Vm {
                 let signal = Arc::new(crate::virtio::vsock::IrqSignal {
                     interrupt_status,
                     signal_fn: Box::new(move || {
-                        let _ = vm_fd.set_irq_line(irq, true);
-                        let _ = vm_fd.set_irq_line(irq, false);
+                        let _ = set_spi_line(&vm_fd, irq, true);
+                        let _ = set_spi_line(&vm_fd, irq, false);
                     }),
                 });
                 if let Some(vsock) = transport.device_mut().as_any_mut().downcast_mut::<VirtioVsock>() {
@@ -1050,8 +1108,8 @@ impl Vm {
                                         // Signal guest interrupt
                                         vhost_int.fetch_or(1, std::sync::atomic::Ordering::Release);
                                         drop(bus);
-                                        let _ = vm_fd_clone.set_irq_line(irq, true);
-                                        let _ = vm_fd_clone.set_irq_line(irq, false);
+                                        let _ = set_spi_line(&vm_fd_clone, irq, true);
+                                        let _ = set_spi_line(&vm_fd_clone, irq, false);
                                     }
                                 }
                             }
@@ -1119,8 +1177,8 @@ impl Vm {
                             }
                         }
                         if need_irq {
-                            let _ = vm_fd_clone.set_irq_line(irq, true);
-                            let _ = vm_fd_clone.set_irq_line(irq, false);
+                            let _ = set_spi_line(&vm_fd_clone, irq, true);
+                            let _ = set_spi_line(&vm_fd_clone, irq, false);
                         }
                     }
                 })
@@ -1198,8 +1256,8 @@ impl Vm {
                                     transport.raise_config_change_interrupt();
                                 }
                             }
-                            let _ = vm_fd_clone.set_irq_line(balloon_irq, true);
-                            let _ = vm_fd_clone.set_irq_line(balloon_irq, false);
+                            let _ = set_spi_line(&vm_fd_clone, balloon_irq, true);
+                            let _ = set_spi_line(&vm_fd_clone, balloon_irq, false);
                         }
 
                         // Periodically refresh overcommit tracking (every 10 ticks = 10s)
@@ -1368,8 +1426,8 @@ impl Vm {
                                                 serial.enqueue_input(buf[i]);
                                                 if serial.interrupt_enabled() {
                                                     drop(serial);
-                                                    let _ = vm_fd_for_console.set_irq_line(4, true);
-                                                    let _ = vm_fd_for_console.set_irq_line(4, false);
+                                                    let _ = set_spi_line(&vm_fd_for_console, 4, true);
+                                                    let _ = set_spi_line(&vm_fd_for_console, 4, false);
                                                 }
                                             }
                                         }

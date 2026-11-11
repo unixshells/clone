@@ -88,6 +88,8 @@ pub fn load_kernel_with_pci(
 /// Arch dispatch: aarch64 boots an Image + hand-built DTB (kvmhost path);
 /// x86_64 keeps the bzImage/boot_params loader. `mmio_devices` is the
 /// registered virtio-mmio (base, irq) table — used for DTB nodes on arm64.
+/// `ram_size` = total guest RAM bytes; on aarch64 it is the span of the
+/// single KVM slot registered at GPA 0x40000000 (see Vm::boot).
 pub fn load_kernel_for_arch(
     mem: &GuestMem,
     kernel_path: &str,

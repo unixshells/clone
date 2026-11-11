@@ -352,6 +352,7 @@ pub fn is_arm64_image(data: &[u8]) -> bool {
 }
 
 /// Load kernel Image + initrd + DTB into guest memory.
+/// `ram_span` = usable RAM bytes starting at RAM_BASE (the KVM slot size).
 /// Returns the BSP entry address (Image load address).
 pub fn load_image_boot(
     mem: &GuestMem,
@@ -359,16 +360,13 @@ pub fn load_image_boot(
     initrd_path: Option<&str>,
     cmdline: &str,
     num_cpus: u32,
-    ram_size: u64,
+    ram_span: u64,
     mmio_devices: &[(u64, u32)],
 ) -> Result<GuestAddress> {
-    if ram_size <= RAM_BASE {
-        bail!(
-            "arm64 guest needs RAM above {RAM_BASE:#x}: configured {ram_size:#x} \
-             (mem_mb must be ≥ (RAM_BASE+256MB)/1MB = 1536)"
-        );
+    let ram_span = ram_span.min(0xC000_0000 - RAM_BASE);
+    if ram_span < 0x0800_0000 {
+        bail!("arm64 guest RAM span too small: {ram_span:#x} (need ≥ 128MB above {RAM_BASE:#x})");
     }
-    let ram_span = (ram_size - RAM_BASE).min(0xC000_0000 - RAM_BASE);
 
     let kernel_data = std::fs::read(kernel_path)
         .with_context(|| format!("Failed to read kernel Image: {kernel_path}"))?;
@@ -377,8 +375,12 @@ pub fn load_image_boot(
             "not an arm64 kernel Image (missing 'ARM\\x64' magic at 0x38): {kernel_path}"
         );
     }
-    let text_offset = if kernel_data.len() >= 8 {
-        let t = u32::from_le_bytes(kernel_data[4..8].try_into().unwrap()) as u64;
+    // Modern Image header (booting.rst, matches kvmhost.c):
+    //   text_offset u64@0x08 — deprecated, always 0 on modern kernels;
+    //   image_size  u64@0x10 — in-memory size of the decompressed Image;
+    //   flags       u64@0x18; magic @0x38.
+    let text_offset = if kernel_data.len() >= 16 {
+        let t = u64::from_le_bytes(kernel_data[8..16].try_into().unwrap());
         if t != 0 {
             t
         } else {
@@ -387,6 +389,15 @@ pub fn load_image_boot(
     } else {
         DEFAULT_TEXT_OFFSET
     };
+    if kernel_data.len() >= 24 {
+        let img_size = u64::from_le_bytes(kernel_data[16..24].try_into().unwrap());
+        if img_size != 0 && img_size > ram_span - DEFAULT_TEXT_OFFSET {
+            bail!(
+                "Image in-memory size {img_size:#x} exceeds RAM span budget {:#x}",
+                ram_span - DEFAULT_TEXT_OFFSET
+            );
+        }
+    }
     let load = RAM_BASE + text_offset;
     if load + kernel_data.len() as u64 >= DTB_ADDR {
         bail!("kernel Image too large for the layout (overlaps DTB slot)");

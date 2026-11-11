@@ -453,10 +453,9 @@ pub fn run_receiver(
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    use kvm_bindings::{
-        kvm_pit_config, kvm_userspace_memory_region,
-        KVM_MEM_LOG_DIRTY_PAGES, KVM_PIT_SPEAKER_DUMMY,
-    };
+    use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
+    #[cfg(target_arch = "x86_64")]
+    use kvm_bindings::{kvm_pit_config, KVM_PIT_SPEAKER_DUMMY};
     use kvm_ioctls::Kvm;
 
     let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
@@ -500,14 +499,17 @@ pub fn run_receiver(
             .context("Failed to set KVM memory region")?;
     }
 
-    // Create irqchip + PIT + GSI routing
-    vm_fd.create_irq_chip().context("Failed to create irqchip")?;
-    let pit_config = kvm_pit_config {
-        flags: KVM_PIT_SPEAKER_DUMMY,
-        ..Default::default()
-    };
-    vm_fd.create_pit2(pit_config).context("Failed to create PIT")?;
-    crate::vmm::setup_gsi_routing(&vm_fd)?;
+    // Create irqchip + PIT + GSI routing (x86 only)
+    #[cfg(target_arch = "x86_64")]
+    {
+        vm_fd.create_irq_chip().context("Failed to create irqchip")?;
+        let pit_config = kvm_pit_config {
+            flags: KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        };
+        vm_fd.create_pit2(pit_config).context("Failed to create PIT")?;
+        crate::vmm::setup_gsi_routing(&vm_fd)?;
+    }
 
     // Send Ready
     write_msg(&mut stream, MSG_READY, &[])?;

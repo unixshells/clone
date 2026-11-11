@@ -3,8 +3,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+#[cfg(target_arch = "x86_64")]
 use kvm_bindings::{KVM_MAX_CPUID_ENTRIES, Msrs};
-// AsRawFd removed — no longer needed
+// AsRawFd needed for the aarch64 ONE_REG path
+#[cfg(target_arch = "aarch64")]
+use std::os::unix::io::AsRawFd;
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use vm_memory::GuestAddress;
 
@@ -144,6 +147,11 @@ impl Vcpu {
             .create_vcpu(id as u64)
             .context("Failed to create vCPU")?;
 
+        // x86: CPUID passthrough + MTRR/PAT MSRs + LAPIC + long-mode sregs.
+        // aarch64: KVM_ARM_VCPU_INIT (generic_v8 + PSCI 0.2); BSP enters at
+        // the Image load address with x0 = DTB (kvmhost.c contract).
+        #[cfg(target_arch = "x86_64")]
+        {
         // Set up CPUID -- pass through host CPUID with KVM filtering
         let mut cpuid = kvm
             .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
@@ -260,8 +268,67 @@ impl Vcpu {
             regs.rsi = boot_params_addr();
             fd.set_regs(&regs).context("Failed to set regs")?;
         }
+        } // end x86_64 branch
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let arm64 = crate::boot::arm64;
+            let mut vi = arm64::KvmVcpuInit {
+                target: arm64::KVM_ARM_TARGET_GENERIC_V8,
+                features: [0u32; 32],
+            };
+            vi.features[0] |= 1u32 << arm64::KVM_ARM_VCPU_PSCI_0_2;
+            let ret = unsafe {
+                crate::sys::ioctl(
+                    fd.as_raw_fd(),
+                    arm64::KVM_ARM_VCPU_INIT,
+                    &mut vi as *mut _ as *mut libc::c_void,
+                )
+            };
+            if ret < 0 {
+                anyhow::bail!(
+                    "KVM_ARM_VCPU_INIT failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            // BSP enters at the Image load address with x0 = DTB phys addr.
+            if id == 0 {
+                set_arm64_core_reg(
+                    fd.as_raw_fd(),
+                    arm64::REG_ID_X0,
+                    arm64::GUEST_DTB_ADDR.load(Ordering::Relaxed),
+                )?;
+                set_arm64_core_reg(fd.as_raw_fd(), arm64::REG_ID_PC, entry_addr.0)?;
+            }
+        }
 
         Ok(Self { id, fd, vm_fd: Arc::clone(vm_fd), mmio_bus, serial, cmos_index: 0, pm_regs: [0u8; 8], pause_state: None, pci_bus: None, deferred_tsc_deadline: None })
+    }
+
+    /// Write one aarch64 core register via KVM_SET_ONE_REG.
+    #[cfg(target_arch = "aarch64")]
+    fn set_arm64_core_reg(vcpu_fd: libc::c_int, reg_id: u64, value: u64) -> Result<()> {
+        let arm64 = crate::boot::arm64;
+        let mut v = value;
+        let r = arm64::KvmOneReg {
+            id: reg_id,
+            addr: &mut v as *mut u64 as u64,
+        };
+        let ret = unsafe {
+            crate::sys::ioctl(
+                vcpu_fd,
+                arm64::KVM_SET_ONE_REG,
+                &r as *const _ as *mut libc::c_void,
+            )
+        };
+        if ret < 0 {
+            Err(anyhow::anyhow!(
+                "KVM_SET_ONE_REG {reg_id:#x}={value:#x} failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Set the shared pause state for snapshot coordination.
@@ -277,6 +344,7 @@ impl Vcpu {
     /// Create a vCPU and restore its register state from a template snapshot.
     ///
     /// Used by `clone fork` to resume from a CoW template without re-booting.
+    #[cfg(target_arch = "x86_64")]
     pub fn from_template(
         kvm: &Kvm,
         vm_fd: &Arc<VmFd>,
@@ -469,6 +537,20 @@ impl Vcpu {
         Ok(Self { id, fd, vm_fd: Arc::clone(vm_fd), mmio_bus, serial, cmos_index: 0, pm_regs: [0u8; 8], pause_state: None, pci_bus: None, deferred_tsc_deadline })
     }
 
+    /// aarch64: template/fork restore is x86-only for now — fresh boot
+    /// (the /lokiinit path) works.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn from_template(
+        _kvm: &Kvm,
+        _vm_fd: &Arc<VmFd>,
+        _id: u32,
+        _vcpu_state: &crate::boot::template::VcpuState,
+        _mmio_bus: Arc<Mutex<MmioBus>>,
+        _serial: Arc<Mutex<Serial>>,
+    ) -> Result<Self> {
+        anyhow::bail!("template/fork restore not yet ported to this arch (x86-only)")
+    }
+
     /// Serialize a KVM struct to bytes.
     fn to_bytes<T>(val: &T) -> Vec<u8> {
         unsafe {
@@ -480,6 +562,7 @@ impl Vcpu {
     }
 
     /// Capture complete vCPU state for snapshotting.
+    #[cfg(target_arch = "x86_64")]
     pub fn capture_state(&self) -> Result<crate::boot::template::VcpuState> {
         let regs = self.fd.get_regs().context("get kvm_regs")?;
         let sregs = self.fd.get_sregs().context("get kvm_sregs")?;
@@ -522,9 +605,16 @@ impl Vcpu {
         })
     }
 
+    /// aarch64: snapshot capture is x86-only for now.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn capture_state(&self) -> Result<crate::boot::template::VcpuState> {
+        anyhow::bail!("snapshot capture not yet ported to this arch (x86-only)")
+    }
+
     /// Capture all MSRs from the vCPU. Uses KVM's msrs_to_save list
     /// (like Firecracker) to capture ALL MSRs the vCPU needs, not just
     /// a hardcoded subset.
+    #[cfg(target_arch = "x86_64")]
     fn capture_msrs(&self) -> Result<Vec<u8>> {
         // Get the full list of MSRs KVM says need saving
         let kvm = kvm_ioctls::Kvm::new().context("open /dev/kvm for MSR list")?;
@@ -565,6 +655,9 @@ impl Vcpu {
         Ok(serde_json::to_vec(&all_entries).unwrap_or_default())
     }
 
+    /// run_loop deferred TSC_DEADLINE handling — x86 only (arm64 vCPUs have
+    /// no LAPIC; the arch timer is managed in-kernel via the vGIC).
+    #[cfg(target_arch = "x86_64")]
     /// Check if a pause has been requested and handle it.
     ///
     /// Captures register state, increments paused count, notifies the
@@ -611,6 +704,7 @@ impl Vcpu {
         // This must be the LAST thing before entering the guest to prevent
         // Restart the LAPIC timer to fire immediately (one-shot mode).
         // This wakes the guest from HLT and lets hrtimer_interrupt reprogram.
+        #[cfg(target_arch = "x86_64")]
         if self.deferred_tsc_deadline.take().is_some() {
             if let Ok(mut lapic) = self.fd.get_lapic() {
                 // Force one-shot mode if snapshot had TSC-deadline
@@ -630,6 +724,8 @@ impl Vcpu {
                 let _ = self.fd.set_lapic(&lapic);
             }
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = self.deferred_tsc_deadline.take();
 
         let mut exit_count: u64 = 0;
         let mut serial_bytes: u64 = 0;
@@ -638,6 +734,7 @@ impl Vcpu {
         loop {
             if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
                 self.serial.lock().unwrap().flush_output();
+                #[cfg(target_arch = "x86_64")]
                 if let Ok(regs) = self.fd.get_regs() {
                     tracing::info!(
                         "vCPU {} shutting down: RIP={:#x} RSP={:#x} RFLAGS={:#x} exits={} serial={}",
@@ -646,6 +743,11 @@ impl Vcpu {
                 } else {
                     tracing::info!("vCPU {} shutting down (signal received)", self.id);
                 }
+                #[cfg(not(target_arch = "x86_64"))]
+                tracing::info!(
+                    "vCPU {} shutting down (signal received) exits={} serial={}",
+                    self.id, exit_count, serial_bytes
+                );
                 break;
             }
             let action = match self.fd.run() {
@@ -675,6 +777,16 @@ impl Vcpu {
                         ExitAction::IoIn { port }
                     }
                     VcpuExit::MmioRead(addr, data) => {
+                        // aarch64: PL011 UART window — earlycon reads return
+                        // all-clear flags (0), which keeps the kernel's TX
+                        // poll loop moving.
+                        #[cfg(target_arch = "aarch64")]
+                        if addr >= crate::boot::arm64::PL011_BASE
+                            && addr < crate::boot::arm64::PL011_BASE + crate::boot::arm64::PL011_SIZE
+                        {
+                            data.fill(0x00);
+                            return Ok(ExitAction::MmioRead { addr, len: data.len() });
+                        }
                         let mut handled = false;
                         // Try PCI bus first (ECAM + BAR regions)
                         if let Some(ref pci_bus) = self.pci_bus {
@@ -695,6 +807,19 @@ impl Vcpu {
                         ExitAction::MmioRead { addr, len: data.len() }
                     }
                     VcpuExit::MmioWrite(addr, data) => {
+                        // aarch64: PL011 UART window — forward bytes to the
+                        // host console (guest earlycon/console=ttyAMA0).
+                        #[cfg(target_arch = "aarch64")]
+                        if addr >= crate::boot::arm64::PL011_BASE
+                            && addr < crate::boot::arm64::PL011_BASE + crate::boot::arm64::PL011_SIZE
+                        {
+                            use std::io::Write;
+                            let out = std::io::stdout();
+                            let mut lock = out.lock();
+                            let _ = lock.write_all(data);
+                            let _ = lock.flush();
+                            return Ok(ExitAction::MmioWrite { addr, data_bytes: [0u8; 8], len: data.len() });
+                        }
                         let len = data.len();
                         let mut data_bytes = [0u8; 8];
                         let copy_len = len.min(8);
@@ -708,6 +833,7 @@ impl Vcpu {
                     if e.errno() == libc::EAGAIN || e.errno() == libc::EINTR {
                         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                             self.serial.lock().unwrap().flush_output();
+                            #[cfg(target_arch = "x86_64")]
                             if let Ok(regs) = self.fd.get_regs() {
                                 let cr2 = self.fd.get_sregs().map(|s| s.cr2).unwrap_or(0);
                                 tracing::info!(
@@ -717,12 +843,18 @@ impl Vcpu {
                             } else {
                                 tracing::info!("vCPU {} received shutdown signal", self.id);
                             }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            tracing::info!(
+                                "vCPU {} signal shutdown: exits={} serial={}",
+                                self.id, exit_count, serial_bytes
+                            );
                             break;
                         }
                         // Check if this EINTR was from a pause request (SIGUSR1)
                         self.check_pause();
                         continue;
                     }
+                    #[cfg(target_arch = "x86_64")]
                     if let Ok(regs) = self.fd.get_regs() {
                         if let Ok(sregs) = self.fd.get_sregs() {
                             tracing::error!(
@@ -835,6 +967,7 @@ impl Vcpu {
 /// The kernel reads CMOS during boot for time-of-day and hardware detection.
 /// Critical: register 0x0A bit 7 must be 0 (no update in progress) or the
 /// kernel spins forever waiting for the RTC update cycle to finish.
+#[cfg(target_arch = "x86_64")]
 fn cmos_read(index: u8) -> u8 {
     match index {
         // RTC time registers — return epoch-ish values (BCD format)
@@ -856,11 +989,13 @@ fn cmos_read(index: u8) -> u8 {
 
 /// Address where boot_params struct is placed in guest memory.
 /// Convention from Linux x86 boot protocol.
+#[cfg(target_arch = "x86_64")]
 fn boot_params_addr() -> u64 {
     0x7000
 }
 
 /// Configure segment registers and page tables for 64-bit long mode.
+#[cfg(target_arch = "x86_64")]
 fn setup_long_mode(sregs: &mut kvm_bindings::kvm_sregs) {
     // Set up page tables for identity mapping
     // PML4 at 0x9000, PDPT at 0xA000, PD at 0xB000

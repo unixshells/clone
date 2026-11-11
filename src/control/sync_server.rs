@@ -476,8 +476,11 @@ fn handle_snapshot(vm: &VmHandle, output_path: &str) -> Response {
             .collect();
 
         // Save in-kernel irqchip state (PIC master, PIC slave, IOAPIC) and PIT
-        let mut irqchip_states = Vec::new();
-        let mut pit_bytes = Vec::new();
+        // x86-only: aarch64 has no PIC/IOAPIC/PIT to save (vGIC state lives
+        // in-kernel and is regenerated on the fresh-boot path).
+        #[cfg(target_arch = "x86_64")]
+        let (mut irqchip_states, mut pit_bytes) = (Vec::new(), Vec::new());
+        #[cfg(target_arch = "x86_64")]
         if let Some(ref vm_fd) = vm.vm_fd {
             use kvm_bindings::{KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_IRQCHIP_IOAPIC, kvm_irqchip};
             for chip_id in [KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_IRQCHIP_IOAPIC] {
@@ -509,6 +512,9 @@ fn handle_snapshot(vm: &VmHandle, output_path: &str) -> Response {
             }
         }
 
+        #[cfg(not(target_arch = "x86_64"))]
+        let (irqchip_states, pit_bytes): (Vec<Vec<u8>>, Vec<u8>) = (Vec::new(), Vec::new());
+
         DeviceStates {
             serial: None,
             virtio_configs: std::collections::HashMap::new(),
@@ -519,10 +525,14 @@ fn handle_snapshot(vm: &VmHandle, output_path: &str) -> Response {
     };
 
     // 3. Save kvmclock and template
+    // x86-only (KVM_GET_CLOCK is an x86 ioctl); arm64 guests use the arch timer.
+    #[cfg(target_arch = "x86_64")]
     let clock_ns = vm.vm_fd.as_ref()
         .and_then(|fd| fd.get_clock().ok())
         .map(|c| c.clock)
         .unwrap_or(0);
+    #[cfg(not(target_arch = "x86_64"))]
+    let clock_ns: u64 = 0;
 
     let result = {
         let guest_mem = unsafe {

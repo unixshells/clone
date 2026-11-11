@@ -5,13 +5,15 @@ pub mod vcpu;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+#[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    kvm_pit_config, kvm_userspace_memory_region,
+    kvm_pit_config,
     kvm_irq_routing, kvm_irq_routing_entry,
     KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQCHIP_IOAPIC,
     KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_PIT_SPEAKER_DUMMY, KVM_MEM_LOG_DIRTY_PAGES,
+    KVM_PIT_SPEAKER_DUMMY,
 };
+use kvm_bindings::{kvm_userspace_memory_region, KVM_MEM_LOG_DIRTY_PAGES};
 use kvm_ioctls::{Kvm, VmFd};
 
 use crate::boot;
@@ -199,30 +201,38 @@ impl Vm {
 
         let t_memory = boot_start.elapsed();
 
-        // 3. Create in-kernel irqchip (LAPIC + IOAPIC) -- must happen before vCPU creation
-        self.vm_fd
-            .create_irq_chip()
-            .context("Failed to create in-kernel irqchip (LAPIC + IOAPIC)")?;
+        // 3. Create in-kernel irqchip + PIT + GSI routing — x86 only.
+        //    On aarch64 the vGICv3 device is created after the vCPUs
+        //    (kvm_arch_vcpu_precreate() refuses once vGIC is up).
+        #[cfg(target_arch = "x86_64")]
+        {
+            // 3. Create in-kernel irqchip (LAPIC + IOAPIC) -- must happen before vCPU creation
+            self.vm_fd
+                .create_irq_chip()
+                .context("Failed to create in-kernel irqchip (LAPIC + IOAPIC)")?;
 
-        // 4. Create in-kernel PIT (i8254 timer) -- must happen before vCPU creation
-        //    KVM_PIT_SPEAKER_DUMMY: handle port 0x61 in-kernel so the kernel's
-        //    PIT verification loop (which reads port 0x61 bit 5) works correctly.
-        let pit_config = kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        };
-        self.vm_fd
-            .create_pit2(pit_config)
-            .context("Failed to create in-kernel PIT (i8254)")?;
+            // 4. Create in-kernel PIT (i8254 timer) -- must happen before vCPU creation
+            //    KVM_PIT_SPEAKER_DUMMY: handle port 0x61 in-kernel so the kernel's
+            //    PIT verification loop (which reads port 0x61 bit 5) works correctly.
+            let pit_config = kvm_pit_config {
+                flags: KVM_PIT_SPEAKER_DUMMY,
+                ..Default::default()
+            };
+            self.vm_fd
+                .create_pit2(pit_config)
+                .context("Failed to create in-kernel PIT (i8254)")?;
 
-        // 5. Set up explicit GSI routing (PIT/PIC/IOAPIC)
-        setup_gsi_routing(&self.vm_fd)?;
+            // 5. Set up explicit GSI routing (PIT/PIC/IOAPIC)
+            setup_gsi_routing(&self.vm_fd)?;
+        }
 
         let t_irqchip = boot_start.elapsed();
-        tracing::info!("In-kernel irqchip (LAPIC + IOAPIC) and PIT created");
+        tracing::info!("arch init: irqchip stage complete");
 
         // 5. Register virtio devices with the MMIO bus
         let mut virtio_cmdline_params = Vec::new();
+        // (base, irq) table for the arm64 DTB virtio-mmio nodes
+        let mut mmio_devices: Vec<(u64, u32)> = Vec::new();
 
         {
             let mut mmio_bus = self.mmio_bus.lock().unwrap();
@@ -234,6 +244,7 @@ impl Vm {
             self.mem_size = mem_size;
             self.kvm_slot_size = alloc_size;
             let (base, irq) = mmio_bus.register(Box::new(balloon));
+            mmio_devices.push((base, irq));
             self.balloon_irq = Some(irq);
             virtio_cmdline_params.push(format!(
                 "virtio_mmio.device=0x{:x}@0x{:x}:{}",
@@ -249,6 +260,7 @@ impl Vm {
                     self.vsock_dev_index = Some(dev_idx);
                     self.vsock_irq = Some(predicted_irq);
                     let (base, irq) = mmio_bus.register(Box::new(vsock));
+                    mmio_devices.push((base, irq));
                     debug_assert_eq!(irq, predicted_irq);
                     virtio_cmdline_params.push(format!(
                         "virtio_mmio.device=0x{:x}@0x{:x}:{}",
@@ -265,6 +277,7 @@ impl Vm {
                 match crate::virtio::block::VirtioBlock::open(block_path, false) {
                     Ok(block) => {
                         let (base, irq) = mmio_bus.register(Box::new(block));
+                        mmio_devices.push((base, irq));
                         virtio_cmdline_params.push(format!(
                             "virtio_mmio.device=0x{:x}@0x{:x}:{}",
                             MMIO_STRIDE, base, irq
@@ -281,6 +294,7 @@ impl Vm {
                 match crate::virtio::block::VirtioBlock::open(overlay_path, false) {
                     Ok(block) => {
                         let (base, irq) = mmio_bus.register(Box::new(block));
+                        mmio_devices.push((base, irq));
                         virtio_cmdline_params.push(format!(
                             "virtio_mmio.device=0x{:x}@0x{:x}:{}",
                             MMIO_STRIDE, base, irq
@@ -308,6 +322,7 @@ impl Vm {
                 if root_dir.is_dir() {
                     let fs_dev = crate::virtio::fs::VirtioFs::new(root_dir, tag.clone());
                     let (base, irq) = mmio_bus.register(Box::new(fs_dev));
+                    mmio_devices.push((base, irq));
                     virtio_cmdline_params.push(format!(
                         "virtio_mmio.device=0x{:x}@0x{:x}:{}",
                         MMIO_STRIDE, base, irq
@@ -338,6 +353,7 @@ impl Vm {
                         let call_fds = net_dev.call_fds();
                         let dev_index = mmio_bus.device_count();
                         let (base, actual_irq) = mmio_bus.register(Box::new(net_dev));
+                        mmio_devices.push((base, actual_irq));
                         debug_assert_eq!(irq, actual_irq);
                         virtio_cmdline_params.push(format!(
                             "virtio_mmio.device=0x{:x}@0x{:x}:{}",
@@ -407,7 +423,7 @@ impl Vm {
         tracing::info!("Kernel command line: {cmdline}");
 
         // 6. Load kernel into guest memory
-        let kernel_entry = boot::load_kernel_with_pci(
+        let kernel_entry = boot::load_kernel_for_arch(
             &guest_memory,
             &self.config.kernel_path,
             self.config.initrd_path.as_deref(),
@@ -415,6 +431,7 @@ impl Vm {
             self.config.vcpus,
             mem_size,
             pci_enabled,
+            &mmio_devices,
         )
         .context("Failed to load kernel")?;
 
@@ -435,6 +452,86 @@ impl Vm {
                 vcpu.set_pci_bus(Arc::clone(pci_bus));
             }
             self.vcpus.push(vcpu);
+        }
+
+        // 7b. aarch64: create + place + explicitly init the vGICv3 device.
+        // Order per kvmhost.c (proven on the 5.10 vendor kernel):
+        // vCPU FIRST (kvm_arch_vcpu_precreate refuses once vGIC is up),
+        // then device, DIST addr, REDIST addr, CTRL_INIT.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let arm64 = crate::boot::arm64;
+            let mut cd = arm64::KvmCreateDevice {
+                dev_type: arm64::KVM_DEV_TYPE_ARM_VGIC_V3,
+                fd: 0,
+                flags: 0,
+            };
+            let ret = unsafe {
+                crate::sys::ioctl(
+                    self.vm_fd.as_raw_fd(),
+                    arm64::KVM_CREATE_DEVICE,
+                    &mut cd as *mut _ as *mut libc::c_void,
+                )
+            };
+            if ret < 0 {
+                return Err(anyhow::anyhow!(
+                    "KVM_CREATE_DEVICE(ARM_VGIC_V3) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let vgic_fd = cd.fd;
+
+            let set_attr = |group: u32, attr: u64, val: u64| -> Result<()> {
+                let mut attr_data = val;
+                let a = arm64::KvmDeviceAttr {
+                    flags: 0,
+                    group,
+                    attr,
+                    addr: &mut attr_data as *mut u64 as u64,
+                };
+                let ret = unsafe {
+                    crate::sys::ioctl(
+                        vgic_fd,
+                        arm64::KVM_SET_DEVICE_ATTR,
+                        &a as *const _ as *mut libc::c_void,
+                    )
+                };
+                if ret < 0 {
+                    Err(anyhow::anyhow!(
+                        "vGIC attr group={group} attr={attr} failed: {}",
+                        std::io::Error::last_os_error()
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+
+            set_attr(
+                arm64::KVM_DEV_ARM_VGIC_GRP_ADDR,
+                arm64::KVM_VGIC_V3_ADDR_TYPE_DIST,
+                arm64::GIC_DIST_BASE,
+            )
+            .context("vgic-v3 DIST addr")?;
+            set_attr(
+                arm64::KVM_DEV_ARM_VGIC_GRP_ADDR,
+                arm64::KVM_VGIC_V3_ADDR_TYPE_REDIST,
+                arm64::GIC_REDIST_BASE,
+            )
+            .context("vgic-v3 REDIST addr")?;
+            set_attr(
+                arm64::KVM_DEV_ARM_VGIC_GRP_CTRL,
+                arm64::KVM_DEV_ARM_VGIC_CTRL_INIT,
+                0,
+            )
+            .context("vgic-v3 CTRL_INIT")?;
+            // vgic fd intentionally leaked for the VM's lifetime (KVM owns state;
+            // closing early can tear the interrupt controller down).
+            tracing::info!(
+                "vGICv3 created: dist@{:#x} redist@{:#x} ({} vcpus)",
+                arm64::GIC_DIST_BASE,
+                arm64::GIC_REDIST_BASE,
+                self.config.vcpus
+            );
         }
 
         self.guest_memory = Some(guest_memory);
@@ -532,22 +629,26 @@ impl Vm {
         }
 
         // 3. Create in-kernel irqchip and PIT (required before restore)
-        self.vm_fd
-            .create_irq_chip()
-            .context("Failed to create in-kernel irqchip")?;
-        let pit_config = kvm_pit_config {
-            flags: KVM_PIT_SPEAKER_DUMMY,
-            ..Default::default()
-        };
-        self.vm_fd
-            .create_pit2(pit_config)
-            .context("Failed to create in-kernel PIT")?;
-        setup_gsi_routing(&self.vm_fd)?;
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.vm_fd
+                .create_irq_chip()
+                .context("Failed to create in-kernel irqchip")?;
+            let pit_config = kvm_pit_config {
+                flags: KVM_PIT_SPEAKER_DUMMY,
+                ..Default::default()
+            };
+            self.vm_fd
+                .create_pit2(pit_config)
+                .context("Failed to create in-kernel PIT")?;
+            setup_gsi_routing(&self.vm_fd)?;
+        }
 
         // 3b. Restore VM state: PIT → clock → PICs → IOAPIC
         // (matches Firecracker's restore_state order exactly)
 
         // Restore PIT state from snapshot
+        #[cfg(target_arch = "x86_64")]
         if !template.device_states.pit.is_empty() {
             let expected = std::mem::size_of::<kvm_bindings::kvm_pit_state2>();
             if template.device_states.pit.len() == expected {
@@ -568,6 +669,7 @@ impl Vm {
         }
 
         // Restore irqchip (PIC master, PIC slave, IOAPIC) from snapshot
+        #[cfg(target_arch = "x86_64")]
         if template.device_states.irqchip.len() == 3 {
             use kvm_bindings::kvm_irqchip;
             let expected_size = std::mem::size_of::<kvm_irqchip>();
@@ -1320,6 +1422,7 @@ impl Vm {
 /// This matches what KVM sets up by default with create_irq_chip(), but
 /// being explicit ensures nothing is missed. GSI 0-7 go to both PIC master
 /// and IOAPIC, GSI 8-15 to PIC slave and IOAPIC, GSI 16-23 to IOAPIC only.
+#[cfg(target_arch = "x86_64")]
 pub fn setup_gsi_routing(vm_fd: &VmFd) -> Result<()> {
     // Build routing entries: 24 IOAPIC + 8 PIC master + 8 PIC slave = 40 entries
     let mut entries: Vec<kvm_irq_routing_entry> = Vec::with_capacity(40);

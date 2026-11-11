@@ -59,13 +59,15 @@ pub const KVM_ARM_TARGET_GENERIC_V8: u32 = 5;
 pub const KVM_ARM_VCPU_PSCI_0_2: u32 = 2;
 
 /// KVM_CREATE_DEVICE = _IOWR(0xAE, 0xe0, kvm_create_device)
-pub const KVM_CREATE_DEVICE: u64 = 0xC010AEE0;
+/// (struct kvm_create_device = 3×u32 = 12 bytes)
+pub const KVM_CREATE_DEVICE: u64 = 0xC00CAEE0;
 /// KVM_SET_DEVICE_ATTR = _IOW(0xAE, 0xe1, kvm_device_attr)
 pub const KVM_SET_DEVICE_ATTR: u64 = 0x4018AEE1;
 /// KVM_SET_ONE_REG = _IOW(0xAE, 0xac, kvm_one_reg)
 pub const KVM_SET_ONE_REG: u64 = 0x4010AEAC;
-/// KVM_ARM_VCPU_INIT = _IOW(0xAE, 0xae, kvm_vcpu_init)  (struct is 132 bytes)
-pub const KVM_ARM_VCPU_INIT: u64 = 0x4084AEEE;
+/// KVM_ARM_VCPU_INIT = _IOW(0xAE, 0xae, kvm_vcpu_init)
+/// (struct kvm_vcpu_init = target u32 + features[7] u32 = 32 bytes)
+pub const KVM_ARM_VCPU_INIT: u64 = 0x4020AEEE;
 
 /// KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | offset/4
 /// KVM_REG_ARM64=0x6000_0000_0000_0000, SIZE_U64=0x0030_0000_0000_0000,
@@ -82,7 +84,7 @@ pub const REG_ID_X0: u64 = core_reg_id(0);
 #[derive(Default)]
 pub struct KvmVcpuInit {
     pub target: u32,
-    pub features: [u32; 32],
+    pub features: [u32; 7],
 }
 
 #[repr(C)]
